@@ -1,0 +1,25 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Logs
+*.log
+*.txt
+
+# Media & uploads
+uploads/
+captured_images/
+*.webm
+*.mp4
+
+# Large tools
+ffmpeg-master-latest-win64-gpl/
+gfpgan/weights/
+
+# Secrets
+serviceAccountKey.json
+
+# OS
+.DS_Store
+Thumbs.db
