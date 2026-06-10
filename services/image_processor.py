@@ -1,9 +1,54 @@
 import cv2
 import numpy as np
 import logging
+import os
+
+try:
+    import mediapipe as mp
+except ImportError:
+    mp = None
+
+FACE_POINTS = {
+    "LIP_UPPER": [61, 185, 40, 39, 37, 0, 267, 269, 270, 409, 291, 308, 415, 310, 312, 13, 82, 81, 80, 191, 78],
+    "LIP_LOWER": [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 308, 324, 402, 317, 14, 87, 178, 88, 95, 78, 61],
+    "EYEBROW_LEFT": [55, 107, 66, 105, 63, 70, 46, 53, 52, 65, 55],
+    "EYEBROW_RIGHT": [285, 336, 296, 334, 293, 300, 276, 283, 295, 285],
+    "EYELINER_LEFT": [243, 112, 26, 22, 23, 24, 110, 25, 226, 130, 33, 7, 163, 144, 145, 153, 154, 155, 133, 243],
+    "EYELINER_RIGHT": [463, 362, 382, 381, 380, 374, 373, 390, 249, 263, 359, 446, 255, 339, 254, 253, 252, 256, 341, 463],
+    "EYESHADOW_LEFT": [226, 247, 30, 29, 27, 28, 56, 190, 243, 173, 157, 158, 159, 160, 161, 246, 33, 130, 226],
+    "EYESHADOW_RIGHT": [463, 414, 286, 258, 257, 259, 260, 467, 446, 359, 263, 466, 388, 387, 386, 385, 384, 398, 362, 463],
+}
 
 class ImageProcessor:
     def __init__(self):
+        self.face_mesh = None
+        self.face_landmarker = None
+        if mp is not None and hasattr(mp, "solutions"):
+            self.face_mesh = mp.solutions.face_mesh.FaceMesh(
+                static_image_mode=True,
+                max_num_faces=1,
+                refine_landmarks=True,
+                min_detection_confidence=0.5
+            )
+        elif mp is not None:
+            model_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "models", "face_landmarker.task")
+            if os.path.exists(model_path):
+                try:
+                    from mediapipe.tasks import python
+                    from mediapipe.tasks.python import vision
+
+                    base_options = python.BaseOptions(model_asset_path=model_path)
+                    options = vision.FaceLandmarkerOptions(
+                        base_options=base_options,
+                        output_face_blendshapes=False,
+                        output_facial_transformation_matrixes=False,
+                        num_faces=1
+                    )
+                    self.face_landmarker = vision.FaceLandmarker.create_from_options(options)
+                except Exception as e:
+                    logging.warning(f"MediaPipe Tasks face landmarker unavailable: {e}")
+            else:
+                logging.warning("MediaPipe face_landmarker.task not found; virtual makeup landmarks are disabled")
         print("ImageProcessor: Ready.")
 
     def create_skin_mask(self, img):
@@ -150,6 +195,121 @@ class ImageProcessor:
         
         return cv2.merge([b, g, r])
 
+    def apply_makeup_light_tone(self, img, mask):
+        """
+        Light makeup tone: brighten skin slightly and add a subtle healthy tint.
+        """
+        hls = cv2.cvtColor(img, cv2.COLOR_BGR2HLS)
+        h, l, s = cv2.split(hls)
+
+        l = np.clip(l.astype(np.int16) + 6, 0, 255).astype(np.uint8)
+        s = np.clip(s.astype(np.int16) + 3, 0, 255).astype(np.uint8)
+
+        toned = cv2.cvtColor(cv2.merge([h, l, s]), cv2.COLOR_HLS2BGR)
+        b, g, r = cv2.split(toned)
+        r = cv2.LUT(r, np.array([min(255, i + 3) for i in range(256)]).astype("uint8"))
+        b = cv2.LUT(b, np.array([min(255, i + 1) for i in range(256)]).astype("uint8"))
+        toned = cv2.merge([b, g, r])
+
+        mask_f = (mask.astype(float) / 255.0)[:, :, np.newaxis]
+        return (toned * mask_f + img * (1.0 - mask_f)).astype(np.uint8)
+
+    def _read_face_landmarks(self, img):
+        if self.face_mesh is None and self.face_landmarker is None:
+            return None
+
+        height, width = img.shape[:2]
+        coords = {}
+
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        if self.face_mesh is not None:
+            results = self.face_mesh.process(rgb)
+            if not results.multi_face_landmarks:
+                return None
+            landmarks = results.multi_face_landmarks[0].landmark
+        else:
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb))
+            results = self.face_landmarker.detect(mp_image)
+            if not results.face_landmarks:
+                return None
+            landmarks = results.face_landmarks[0]
+
+        for idx, landmark in enumerate(landmarks):
+            x = int(np.clip(landmark.x * width, 0, width - 1))
+            y = int(np.clip(landmark.y * height, 0, height - 1))
+            coords[idx] = (x, y)
+        return coords
+
+    def _blend_feature(self, base, overlay, alpha, coords, point_ids, color, opacity, blur=9):
+        points = [coords.get(idx) for idx in point_ids]
+        if any(point is None for point in points) or len(points) < 3:
+            return
+
+        feature_mask = np.zeros(alpha.shape, dtype=np.uint8)
+        cv2.fillPoly(feature_mask, [np.array(points, dtype=np.int32)], 255)
+
+        if blur % 2 == 0:
+            blur += 1
+        feature_mask = cv2.GaussianBlur(feature_mask, (blur, blur), 0)
+        feature_alpha = (feature_mask.astype(np.float32) / 255.0) * opacity
+
+        color_layer = np.zeros_like(base, dtype=np.float32)
+        color_layer[:, :] = np.array(color, dtype=np.float32)
+
+        stronger = feature_alpha > alpha
+        overlay[stronger] = color_layer[stronger]
+        alpha[:] = np.maximum(alpha, feature_alpha)
+
+    def _blend_blush(self, base, overlay, alpha, coords, center_idx, color, opacity):
+        center = coords.get(center_idx)
+        if center is None:
+            return
+
+        height, width = alpha.shape
+        radius_x = max(14, int(width * 0.045))
+        radius_y = max(10, int(height * 0.035))
+        feature_mask = np.zeros(alpha.shape, dtype=np.uint8)
+        cv2.ellipse(feature_mask, center, (radius_x, radius_y), 0, 0, 360, 255, -1)
+        feature_mask = cv2.GaussianBlur(feature_mask, (41, 41), 0)
+        feature_alpha = (feature_mask.astype(np.float32) / 255.0) * opacity
+
+        color_layer = np.zeros_like(base, dtype=np.float32)
+        color_layer[:, :] = np.array(color, dtype=np.float32)
+
+        stronger = feature_alpha > alpha
+        overlay[stronger] = color_layer[stronger]
+        alpha[:] = np.maximum(alpha, feature_alpha)
+
+    def apply_virtual_makeup(self, img):
+        coords = self._read_face_landmarks(img)
+        if coords is None:
+            return img, False
+
+        base = img.astype(np.float32)
+        overlay = base.copy()
+        alpha = np.zeros(img.shape[:2], dtype=np.float32)
+
+        style = {
+            "LIP_UPPER": ([84, 66, 188], 0.34),
+            "LIP_LOWER": ([84, 66, 188], 0.30),
+            "EYEBROW_LEFT": ([36, 42, 58], 0.20),
+            "EYEBROW_RIGHT": ([36, 42, 58], 0.20),
+            "EYELINER_LEFT": ([38, 36, 54], 0.24),
+            "EYELINER_RIGHT": ([38, 36, 54], 0.24),
+            "EYESHADOW_LEFT": ([154, 124, 178], 0.16),
+            "EYESHADOW_RIGHT": ([154, 124, 178], 0.16),
+        }
+
+        for name, (color, opacity) in style.items():
+            self._blend_feature(base, overlay, alpha, coords, FACE_POINTS[name], color, opacity)
+
+        self._blend_blush(base, overlay, alpha, coords, 50, [132, 124, 210], 0.18)
+        self._blend_blush(base, overlay, alpha, coords, 280, [132, 124, 210], 0.18)
+
+        alpha = np.clip(alpha, 0.0, 0.45)
+        result = overlay * alpha[:, :, None] + base * (1.0 - alpha[:, :, None])
+        return np.clip(result, 0, 255).astype(np.uint8), True
+
     def process(self, image_path, output_path, filter_type='natural'):
         try:
             img = cv2.imread(image_path)
@@ -164,6 +324,14 @@ class ImageProcessor:
                 d = 10
                 sigma = 20
                 opacity = 0.4 
+            elif filter_type == 'makeup_soft':
+                d = 13
+                sigma = 36
+                opacity = 0.62
+            elif filter_type == 'makeup_light':
+                d = 13
+                sigma = 32
+                opacity = 0.55
             elif filter_type == 'korean':
                 d = 15
                 sigma = 45 
@@ -189,6 +357,13 @@ class ImageProcessor:
             # 3. Tone / Tint
             if filter_type == 'natural':
                 img = self.adjust_skin_tone(img, skin_mask)
+            elif filter_type == 'makeup_soft':
+                img = self.apply_makeup_light_tone(img, skin_mask)
+                img, has_makeup = self.apply_virtual_makeup(img)
+                if not has_makeup:
+                    logging.warning("MediaPipe makeup skipped: no face detected or mediapipe unavailable")
+            elif filter_type == 'makeup_light':
+                img = self.apply_makeup_light_tone(img, skin_mask)
             elif filter_type == 'korean':
                 img = self.adjust_skin_tone(img, skin_mask)
                 img = self.apply_pink_tint(img)
@@ -201,7 +376,11 @@ class ImageProcessor:
             img = self.apply_tone_curve(img)
             
             # 5. Glow
-            if filter_type == 'korean':
+            if filter_type == 'makeup_soft':
+                img = self.apply_soft_glow(img, opacity=0.05, radius=3)
+            elif filter_type == 'makeup_light':
+                img = self.apply_soft_glow(img, opacity=0.06, radius=3)
+            elif filter_type == 'korean':
                 img = self.apply_soft_glow(img, opacity=0.10, radius=3)
             elif filter_type == 'baby_soft':
                 # Radius 12-18 -> let's say 15. Opacity 8-12% -> 0.10

@@ -99,6 +99,7 @@ class Photo(db.Model):
     url = db.Column(db.String(500), nullable=True) # Cloudinary URL
     video_url = db.Column(db.String(500), nullable=True) # Motion Photo Video URL
     public_id = db.Column(db.String(100), nullable=True) # Added for cleanup
+    video_public_id = db.Column(db.String(100), nullable=True) # Cloudinary ID for motion video cleanup
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(UTC))
 
     def to_dict(self):
@@ -108,6 +109,26 @@ class Photo(db.Model):
             'type': self.type,
             'url': self.url,
             'video_url': self.video_url,
+            'public_id': self.public_id,
+            'video_public_id': self.video_public_id,
+            'created_at': self.created_at.isoformat()
+        }
+
+
+class MobileUpload(db.Model):
+    __tablename__ = 'mobile_uploads'
+
+    id = db.Column(db.Integer, primary_key=True)
+    session_uuid = db.Column(db.String(64), index=True, nullable=False)
+    url = db.Column(db.String(500), nullable=False)
+    public_id = db.Column(db.String(150), nullable=True)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(UTC))
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'session_uuid': self.session_uuid,
+            'url': self.url,
             'public_id': self.public_id,
             'created_at': self.created_at.isoformat()
         }
@@ -133,6 +154,35 @@ class PaymentCode(db.Model):
             'expires_at': self.expires_at.isoformat() if self.expires_at else None,
             'used_at': self.used_at.isoformat() if self.used_at else None,
             'created_at': self.created_at.isoformat()
+        }
+
+class PaymentOrder(db.Model):
+    __tablename__ = 'payment_orders'
+
+    id = db.Column(db.Integer, primary_key=True)
+    code = db.Column(db.String(32), unique=True, nullable=False)
+    amount = db.Column(db.Integer, nullable=False)
+    status = db.Column(db.String(20), default='pending') # pending, paid, expired
+    bank = db.Column(db.String(50), nullable=True)
+    account_number = db.Column(db.String(50), nullable=True)
+    transaction_reference = db.Column(db.String(100), nullable=True)
+    raw_payload = db.Column(db.JSON, nullable=True)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(UTC))
+    paid_at = db.Column(db.DateTime, nullable=True)
+    expires_at = db.Column(db.DateTime, nullable=True)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'code': self.code,
+            'amount': self.amount,
+            'status': self.status,
+            'bank': self.bank,
+            'account_number': self.account_number,
+            'transaction_reference': self.transaction_reference,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'paid_at': self.paid_at.isoformat() if self.paid_at else None,
+            'expires_at': self.expires_at.isoformat() if self.expires_at else None
         }
 
 class Config(db.Model):

@@ -4,6 +4,12 @@ logging.info("APP: STARTING UP...")
 
 print("APP: Importing libs...", flush=True)
 from flask import Flask, request, jsonify, send_from_directory
+import os
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
+except ImportError:
+    pass
 # ... (rest of imports)
 
 # ... (inside __main__)
@@ -14,15 +20,16 @@ print("APP: Libs imported", flush=True)
 import datetime
 from datetime import timezone
 UTC = timezone.utc
-import os
 import uuid
 import json
 import cv2
+import hmac
+from urllib.parse import urlencode
 from werkzeug.utils import secure_filename
 import pillow_heif
 pillow_heif.register_heif_opener()
 from PIL import Image, ImageOps
-from models import db, Session, Photo, Frame, PaymentCode, Device, Config, DeviceConfig
+from models import db, Session, Photo, Frame, PaymentCode, PaymentOrder, Device, Config, DeviceConfig, MobileUpload
 import random
 import string
 import cloudinary
@@ -33,25 +40,25 @@ import shutil
 from apscheduler.schedulers.background import BackgroundScheduler
 import atexit
 # Import cleanup manager (will be created next)
-from services.cleanup_manager import cleanup_expired_sessions, cleanup_old_payment_codes
+from services.cleanup_manager import cleanup_expired_sessions, cleanup_old_local_upload_files, cleanup_old_payment_codes, expire_session_if_needed
+from services.print_service import get_available_printers, print_image_file, resolve_printer_name, save_print_image
+from services.supabase_storage import is_supabase_configured, upload_file_to_supabase, upload_path_to_supabase
 
 # Khởi tạo App
 print("APP: Initializing Flask...", flush=True)
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
-app.config['SECRET_KEY'] = 'secret!'
+app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY', 'dev-only-change-me')
 app.config['UPLOAD_FOLDER'] = os.path.join(os.getcwd(), 'uploads', 'frames')
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///photobooth_v2.db'
+app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///photobooth_v2.db')
 
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['MAX_CONTENT_LENGTH'] = 15 * 1024 * 1024 # Limit upload size to 15MB
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024 # Allow larger branding/background videos
 
-# Cloudinary Config
-# Cloudinary Config
 cloudinary.config( 
-    cloud_name = "dmgcwlt88", 
-    api_key = "737347737339893", 
-    api_secret = os.environ.get("CLOUDINARY_API_SECRET", "J2E32NdSb-awkZZ9I_ffwOAiXT0"), # Replace with actual secret
+    cloud_name = os.environ.get("CLOUDINARY_CLOUD_NAME"),
+    api_key = os.environ.get("CLOUDINARY_API_KEY"),
+    api_secret = os.environ.get("CLOUDINARY_API_SECRET"),
     secure=True
 )
 
@@ -60,6 +67,10 @@ os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 db.init_app(app)
 # Initialize SocketIO correctly
 socketio = SocketIO(app, cors_allowed_origins="*")
+
+@app.errorhandler(413)
+def request_entity_too_large(error):
+    return jsonify({'error': 'File quá lớn. Vui lòng chọn file dưới 100MB.'}), 413
 
 # Initialize Scheduler
 def run_with_context(fn):
@@ -71,6 +82,7 @@ def run_with_context(fn):
 
 scheduler = BackgroundScheduler(daemon=True)
 scheduler.add_job(func=run_with_context(cleanup_expired_sessions), trigger="interval", hours=1, id="cleanup_sessions", replace_existing=True)
+scheduler.add_job(func=run_with_context(cleanup_old_local_upload_files), trigger="interval", hours=1, id="cleanup_local_uploads", replace_existing=True)
 scheduler.add_job(func=run_with_context(cleanup_old_payment_codes), trigger="interval", hours=1, id="cleanup_codes", replace_existing=True)
 scheduler.start()
 
@@ -133,6 +145,25 @@ def migrate_data():
     else:
         print("Database is up to date.", flush=True)
     print("APP: migrate_data end", flush=True)
+
+def ensure_runtime_schema():
+    """Add lightweight SQLite columns that db.create_all cannot add to existing tables."""
+    if db.engine.dialect.name != 'sqlite':
+        return
+
+    columns_to_add = {
+        'photos': {
+            'video_public_id': 'VARCHAR(100)'
+        }
+    }
+
+    with db.engine.begin() as conn:
+        for table, columns in columns_to_add.items():
+            existing = {row[1] for row in conn.exec_driver_sql(f"PRAGMA table_info({table})").fetchall()}
+            for column, column_type in columns.items():
+                if column not in existing:
+                    conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
+                    logging.info(f"DB migration: added {table}.{column}")
 
 
 
@@ -399,6 +430,7 @@ def create_session():
             url=p.get('url'),
             video_url=p.get('video_url'),
             public_id=p.get('public_id'),
+            video_public_id=p.get('video_public_id'),
             type=p.get('type', 'raw'),
             created_at=datetime.datetime.now(UTC)
         )
@@ -416,6 +448,8 @@ def get_session(id):
         
     if not session:
         return jsonify({'error': 'Session not found'}), 404
+
+    expire_session_if_needed(session)
         
     return jsonify(session.to_dict())
 
@@ -462,15 +496,34 @@ def upload_mobile():
         
         # URL tương đối để proxy của Vite tự forward tải ảnh đúng IP
         local_url = f"/uploads/temp/{new_filename}"
+        final_url = local_url
+        public_id = f"local:temp/{new_filename}"
+
+        if is_supabase_configured():
+            try:
+                uploaded = upload_path_to_supabase(dest_path, folder="mobile")
+                final_url = uploaded['url']
+                public_id = uploaded['public_id']
+            except Exception as upload_error:
+                logging.warning(f"Mobile Supabase upload failed; using local temp file: {upload_error}")
+
+        mobile_upload = MobileUpload(session_uuid=session_id, url=final_url, public_id=public_id)
+        db.session.add(mobile_upload)
+        db.session.commit()
+
+        socketio.emit('mobile_photo_uploaded', {'session_id': session_id, 'url': final_url})
         
-        # Emit to the specific session room or broadcast for now (let's broadcast and FE filters by session_id, or use rooms)
-        # Using socketio.emit to all clients, FE will match session_id
-        socketio.emit('mobile_photo_uploaded', {'session_id': session_id, 'url': local_url})
-        
-        return jsonify({'success': True, 'url': local_url}), 200
+        return jsonify({'success': True, 'url': final_url, 'public_id': public_id}), 200
     except Exception as e:
+        db.session.rollback()
         print(f"Mobile upload error: {e}", flush=True)
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/mobile-uploads/<session_id>', methods=['GET'])
+def get_mobile_uploads(session_id):
+    uploads = MobileUpload.query.filter_by(session_uuid=session_id).order_by(MobileUpload.created_at.asc()).all()
+    return jsonify([item.to_dict() for item in uploads]), 200
 
 @app.route('/api/network/ip', methods=['GET'])
 def get_lan_ip():
@@ -497,6 +550,49 @@ def upload_cloud():
     if file.filename == '':
         return jsonify({'error': 'No selected file'}), 400
 
+    def save_upload_locally():
+        original_name = secure_filename(file.filename) or 'upload.bin'
+        extension = os.path.splitext(original_name)[1] or '.bin'
+        local_name = f"cloud_{uuid.uuid4().hex}{extension}"
+        cloud_folder = os.path.join(os.getcwd(), 'uploads', 'cloud')
+        os.makedirs(cloud_folder, exist_ok=True)
+        try:
+            file.stream.seek(0)
+        except Exception:
+            pass
+        file.save(os.path.join(cloud_folder, local_name))
+        return {
+            'url': f"/uploads/cloud/{local_name}",
+            'public_id': f"local:cloud/{local_name}",
+            'storage': 'local'
+        }
+
+    cloudinary_ready = all([
+        os.environ.get("CLOUDINARY_CLOUD_NAME"),
+        os.environ.get("CLOUDINARY_API_KEY"),
+        os.environ.get("CLOUDINARY_API_SECRET")
+    ])
+
+    if is_supabase_configured():
+        try:
+            supabase_result = upload_file_to_supabase(file, folder="photobooth")
+            return jsonify(supabase_result), 200
+        except Exception as e:
+            logging.warning(f"Supabase upload failed; trying Cloudinary/local fallback: {e}")
+            try:
+                file.stream.seek(0)
+            except Exception:
+                pass
+
+    if not cloudinary_ready:
+        try:
+            local_result = save_upload_locally()
+            logging.warning("Cloudinary is not configured. Stored upload locally.")
+            return jsonify(local_result), 200
+        except Exception as e:
+            logging.exception("Local upload fallback failed")
+            return jsonify({'error': f'Local upload failed: {str(e)}'}), 500
+
     try:
         # Upload to Cloudinary
         upload_result = cloudinary.uploader.upload(file, resource_type="auto")
@@ -506,8 +602,13 @@ def upload_cloud():
             'public_id': upload_result['public_id']
         }), 200
     except Exception as e:
-        print(f"Cloudinary upload error: {e}")
-        return jsonify({'error': str(e)}), 500
+        try:
+            local_result = save_upload_locally()
+            logging.warning(f"Cloudinary upload failed; stored upload locally instead: {e}")
+            return jsonify(local_result), 200
+        except Exception as local_error:
+            logging.exception("Cloudinary and local upload both failed")
+            return jsonify({'error': f'Upload failed: {str(e)}; local fallback failed: {str(local_error)}'}), 500
 
 # --- Branding Upload API ---
 @app.route('/api/upload/branding', methods=['POST'])
@@ -523,8 +624,10 @@ def upload_branding():
         return jsonify({'error': 'No key provided'}), 400
 
     try:
-        filename = secure_filename(file.filename)
-        unique_filename = f"branding_{uuid.uuid4().hex}_{filename}"
+        filename = secure_filename(file.filename) or 'branding_upload'
+        name, ext = os.path.splitext(filename)
+        safe_name = name[:60].strip('._-') or 'branding_upload'
+        unique_filename = f"branding_{uuid.uuid4().hex}_{safe_name}{ext.lower()}"
         
         branding_folder = os.path.join(app.config['UPLOAD_FOLDER'], '..', 'branding')
         os.makedirs(branding_folder, exist_ok=True)
@@ -547,6 +650,51 @@ def upload_branding():
         db.session.rollback()
         print(f"Branding upload error: {e}", flush=True)
         return jsonify({'error': str(e)}), 500
+
+# --- Printing API ---
+@app.route('/api/printers', methods=['GET'])
+def list_printers():
+    configured_name = get_config_value('printer_name', '')
+    resolved_name, printers = resolve_printer_name(configured_name)
+    return jsonify({
+        'printers': printers,
+        'configured_printer': configured_name,
+        'resolved_printer': resolved_name
+    }), 200
+
+
+@app.route('/api/print', methods=['POST'])
+def print_photo():
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file part'}), 400
+
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'error': 'No selected file'}), 400
+
+    configured_name = request.form.get('printer_name') or get_config_value('printer_name', '')
+    copies = request.form.get('copies', get_config_value('printer_copies', '1'))
+    printer_name, printers = resolve_printer_name(configured_name)
+
+    if not printer_name:
+        return jsonify({
+            'error': 'Không tìm thấy máy in RX1HS trong Windows. Hãy cài driver DNP RX1HS và đặt tên printer có chứa RX1HS/DNP/RX1, hoặc cấu hình đúng printer_name.',
+            'available_printers': printers,
+            'configured_printer': configured_name
+        }), 500
+
+    try:
+        print_folder = os.path.join(os.getcwd(), 'uploads', 'print_jobs')
+        saved_path = save_print_image(file, print_folder)
+        result = print_image_file(saved_path, printer_name, copies)
+        return jsonify({
+            'success': True,
+            'message': 'Đã gửi ảnh sang máy in.',
+            **result
+        }), 200
+    except Exception as e:
+        logging.exception("Print job failed")
+        return jsonify({'error': str(e), 'printer': printer_name}), 500
 
 # --- Payment Code APIs ---
 
@@ -627,6 +775,113 @@ def use_code(id):
     code.is_used = True
     code.used_at = datetime.datetime.now(UTC)
     db.session.commit()
+    return jsonify({'success': True}), 200
+
+# --- SePay QR Payment APIs ---
+
+def get_config_value(key, fallback=None):
+    config = db.session.get(Config, key)
+    return config.value if config and config.value else fallback
+
+def generate_payment_order_code():
+    for _ in range(20):
+        code = f"PTB{''.join(random.choices(string.ascii_uppercase + string.digits, k=8))}"
+        if not PaymentOrder.query.filter_by(code=code).first():
+            return code
+    raise RuntimeError('Could not generate unique payment code')
+
+@app.route('/api/sepay/orders', methods=['POST'])
+def create_sepay_order():
+    data = request.get_json(silent=True) or {}
+    amount = int(data.get('amount') or 0)
+    if amount <= 0:
+        return jsonify({'error': 'Invalid amount'}), 400
+
+    bank = get_config_value('sepay_bank', os.environ.get('SEPAY_BANK'))
+    account_number = get_config_value('sepay_account_number', os.environ.get('SEPAY_ACCOUNT_NUMBER'))
+    template = get_config_value('sepay_template', os.environ.get('SEPAY_TEMPLATE', 'compact')) or 'compact'
+    if not bank or not account_number:
+        return jsonify({
+            'error': 'Sepay bank/account is not configured',
+            'required': ['SEPAY_BANK', 'SEPAY_ACCOUNT_NUMBER']
+        }), 400
+
+    code = generate_payment_order_code()
+    expires_at = datetime.datetime.now(UTC) + datetime.timedelta(minutes=15)
+    order = PaymentOrder(
+        code=code,
+        amount=amount,
+        bank=bank,
+        account_number=account_number,
+        expires_at=expires_at
+    )
+    db.session.add(order)
+    db.session.commit()
+
+    qr_url = f"https://qr.sepay.vn/img?{urlencode({'acc': account_number, 'bank': bank, 'amount': amount, 'des': code, 'template': template})}"
+    return jsonify({
+        **order.to_dict(),
+        'qr_url': qr_url,
+        'content': code
+    }), 201
+
+@app.route('/api/sepay/orders/<code>/status', methods=['GET'])
+def get_sepay_order_status(code):
+    order = PaymentOrder.query.filter_by(code=code).first()
+    if not order:
+        return jsonify({'error': 'Order not found'}), 404
+
+    if order.status == 'pending' and order.expires_at and order.expires_at < datetime.datetime.now(UTC):
+        order.status = 'expired'
+        db.session.commit()
+
+    return jsonify(order.to_dict()), 200
+
+@app.route('/webhook/sepay', methods=['POST'])
+def sepay_webhook():
+    expected_key = os.environ.get('SEPAY_API_KEY')
+    if expected_key:
+        expected_auth = f"Apikey {expected_key}"
+        auth_header = request.headers.get('Authorization', '')
+        if not hmac.compare_digest(auth_header, expected_auth):
+            return jsonify({'success': False, 'message': 'Unauthorized'}), 401
+
+    payload = request.get_json(silent=True) or {}
+    content = str(payload.get('content') or '')
+    webhook_code = str(payload.get('code') or '')
+    transfer_type = str(payload.get('transferType') or '').lower()
+    transfer_amount = int(payload.get('transferAmount') or 0)
+
+    if transfer_type and transfer_type != 'in':
+        return jsonify({'success': True, 'message': 'Ignored non-incoming transfer'}), 200
+
+    order = None
+    candidates = PaymentOrder.query.filter_by(status='pending').order_by(PaymentOrder.created_at.desc()).limit(50).all()
+    for candidate in candidates:
+        if candidate.code == webhook_code or candidate.code in content:
+            order = candidate
+            break
+
+    if not order:
+        return jsonify({'success': True, 'message': 'No matching pending order'}), 200
+
+    if transfer_amount < order.amount:
+        order.raw_payload = payload
+        db.session.commit()
+        return jsonify({'success': True, 'message': 'Transfer amount is lower than order amount'}), 200
+
+    order.status = 'paid'
+    order.paid_at = datetime.datetime.now(UTC)
+    order.transaction_reference = payload.get('referenceCode') or str(payload.get('id') or '')
+    order.raw_payload = payload
+    db.session.commit()
+
+    socketio.emit('sepay_payment_success', {
+        'order_code': order.code,
+        'amount': order.amount,
+        'transaction_reference': order.transaction_reference
+    })
+
     return jsonify({'success': True}), 200
 
 @app.route('/api/revenue/reset', methods=['POST'])
@@ -823,6 +1078,8 @@ def init_configs():
         {'key': 'mobile_price', 'value': '30000'},
         {'key': 'mobile_session_timeout', 'value': '300'}, # 5 minutes
         {'key': 'mobile_print_price', 'value': '10000'},
+        {'key': 'printer_name', 'value': os.environ.get('PRINTER_NAME', 'RX1HS')},
+        {'key': 'printer_copies', 'value': '1'},
         {'key': 'camera_mode', 'value': 'webcam'}, # webcam, hotfolder
         {'key': 'hot_folder', 'value': 'C:/Photobooth_Input'},
         {'key': 'trigger_key', 'value': '{F8}'},
@@ -830,6 +1087,11 @@ def init_configs():
         {'key': 'bill_baudrate', 'value': '9600'},
         {'key': 'bill_enabled', 'value': 'false'},
         {'key': 'bill_mapping', 'value': '{"40": 10000, "41": 20000, "42": 50000, "43": 100000, "44": 200000, "45": 500000}'},
+        {'key': 'sepay_bank', 'value': os.environ.get('SEPAY_BANK', '')},
+        {'key': 'sepay_account_number', 'value': os.environ.get('SEPAY_ACCOUNT_NUMBER', '')},
+        {'key': 'sepay_template', 'value': os.environ.get('SEPAY_TEMPLATE', 'compact')},
+        {'key': 'brand_text_primary', 'value': '#7B5E43'},
+        {'key': 'brand_text_secondary', 'value': '#5E6B78'},
     ]
     
     for item in defaults:
@@ -1008,7 +1270,7 @@ def get_device_id():
         with open("device_id.txt", "w") as f:
             f.write(DEVICE_ID)
             
-    print(f"🆔 DEVICE ID: {DEVICE_ID}", flush=True)
+    print(f"DEVICE ID: {DEVICE_ID}", flush=True)
     return DEVICE_ID
 
 # --- BILL VALIDATOR APIs (Device Aware) ---
@@ -1030,8 +1292,9 @@ def init_bill_service():
 @app.route('/api/devices/<device_id>/config', methods=['GET', 'POST'])
 def device_config_api(device_id):
     if request.method == 'GET':
-        configs = DeviceConfig.query.filter_by(device_id=device_id).all()
-        return jsonify({c.key: c.value for c in configs})
+        global_configs = {c.key: c.value for c in Config.query.all() if c.key.startswith('bill_')}
+        device_configs = {c.key: c.value for c in DeviceConfig.query.filter_by(device_id=device_id).all()}
+        return jsonify({**global_configs, **device_configs})
         
     if request.method == 'POST':
         data = request.json
@@ -1109,6 +1372,22 @@ def get_bill_status():
         'device_id': get_device_id()
     })
 
+@app.route('/api/bill/ports', methods=['GET'])
+def get_bill_ports():
+    try:
+        from serial.tools import list_ports
+        ports = [
+            {
+                'device': port.device,
+                'description': port.description,
+                'hwid': port.hwid
+            }
+            for port in list_ports.comports()
+        ]
+        return jsonify(ports)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 # API to list all known devices (for Dropdown)
 @app.route('/api/devices', methods=['GET'])
 def list_devices():
@@ -1126,20 +1405,25 @@ def register_current_device():
     else:
         device.last_active = datetime.datetime.now(timezone.utc)
     db.session.commit()
-    print(f"✅ Registered Device: {device_id}", flush=True)
+    print(f"Registered Device: {device_id}", flush=True)
 
 
 # Startup Init
 with app.app_context():
     print("APP: Creating DB...", flush=True)
     db.create_all()
+    ensure_runtime_schema()
     print("APP: Running migration...", flush=True)
     migrate_data()
     print("APP: Initializing configs...", flush=True)
     init_configs()
     print("APP: Initializing Bill Service...", flush=True)
     register_current_device()
-    init_bill_service()
+    try:
+        init_bill_service()
+    except Exception as e:
+        logging.exception("Bill service initialization failed")
+        print(f"Bill service initialization failed: {e}", flush=True)
     print("APP: Startup routines done", flush=True)
 
 

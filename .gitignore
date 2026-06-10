@@ -19,6 +19,13 @@ gfpgan/weights/
 
 # Secrets
 serviceAccountKey.json
+.env
+.env.*
+!.env.example
+instance/
+*.db
+*.sqlite
+*.sqlite3
 
 # OS
 .DS_Store
