@@ -16,6 +16,7 @@ captured_images/
 
 # Large tools
 ffmpeg-master-latest-win64-gpl/
+ffmpeg.zip
 gfpgan/weights/
 
 # Secrets
