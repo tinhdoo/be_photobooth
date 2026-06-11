@@ -284,8 +284,8 @@ def cleanup_old_local_upload_files():
 def cleanup_old_payment_codes():
     """
     Deletes payment codes that are:
-    1. Used more than 24 hours ago.
-    2. Expired more than 24 hours ago.
+    1. Used more than 15 days ago.
+    2. Expired more than 15 days ago.
     """
     try:
         if not has_app_context():
@@ -298,7 +298,7 @@ def cleanup_old_payment_codes():
         from models import PaymentCode
         logging.info(f"[CLEANUP] Starting payment codes cleanup job at {datetime.now(UTC)}")
 
-        limit = (datetime.now(UTC) - timedelta(hours=24)).replace(tzinfo=None)
+        limit = (datetime.now(UTC) - timedelta(days=15)).replace(tzinfo=None)
 
         used_expired = PaymentCode.query.filter(
             PaymentCode.is_used == True,
