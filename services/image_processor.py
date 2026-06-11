@@ -214,6 +214,25 @@ class ImageProcessor:
         mask_f = (mask.astype(float) / 255.0)[:, :, np.newaxis]
         return (toned * mask_f + img * (1.0 - mask_f)).astype(np.uint8)
 
+    def apply_rose_white_tone(self, img, mask):
+        """
+        Medium rose-white skin tone: bright enough for print, with a natural pink tint.
+        """
+        hls = cv2.cvtColor(img, cv2.COLOR_BGR2HLS)
+        h, l, s = cv2.split(hls)
+
+        l = np.clip(l.astype(np.int16) + 12, 0, 255).astype(np.uint8)
+        s = np.clip(s.astype(np.int16) - 2, 0, 255).astype(np.uint8)
+
+        toned = cv2.cvtColor(cv2.merge([h, l, s]), cv2.COLOR_HLS2BGR)
+        b, g, r = cv2.split(toned)
+        r = cv2.LUT(r, np.array([min(255, i + 5) for i in range(256)]).astype("uint8"))
+        b = cv2.LUT(b, np.array([min(255, i + 2) for i in range(256)]).astype("uint8"))
+        toned = cv2.merge([b, g, r])
+
+        mask_f = (mask.astype(float) / 255.0)[:, :, np.newaxis]
+        return (toned * mask_f + img * (1.0 - mask_f)).astype(np.uint8)
+
     def _read_face_landmarks(self, img):
         if self.face_mesh is None and self.face_landmarker is None:
             return None
@@ -333,9 +352,9 @@ class ImageProcessor:
                 sigma = 32
                 opacity = 0.55
             elif filter_type == 'korean':
-                d = 15
-                sigma = 45 
-                opacity = 0.7
+                d = 13
+                sigma = 36
+                opacity = 0.58
             elif filter_type == 'baby_soft':
                 d = 15
                 sigma = 40 # smooth
@@ -365,8 +384,7 @@ class ImageProcessor:
             elif filter_type == 'makeup_light':
                 img = self.apply_makeup_light_tone(img, skin_mask)
             elif filter_type == 'korean':
-                img = self.adjust_skin_tone(img, skin_mask)
-                img = self.apply_pink_tint(img)
+                img = self.apply_rose_white_tone(img, skin_mask)
             elif filter_type == 'baby_soft':
                 # "Lift midtone" - done by global tone curve later?
                 # "Pink tone (cực nhẹ)"
@@ -381,7 +399,7 @@ class ImageProcessor:
             elif filter_type == 'makeup_light':
                 img = self.apply_soft_glow(img, opacity=0.06, radius=3)
             elif filter_type == 'korean':
-                img = self.apply_soft_glow(img, opacity=0.10, radius=3)
+                img = self.apply_soft_glow(img, opacity=0.06, radius=3)
             elif filter_type == 'baby_soft':
                 # Radius 12-18 -> let's say 15. Opacity 8-12% -> 0.10
                 img = self.apply_soft_glow(img, opacity=0.10, radius=15)
