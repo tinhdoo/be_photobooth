@@ -1396,7 +1396,7 @@ def init_configs():
         {'key': 'camera_mode', 'value': 'webcam'}, # webcam, hotfolder
         {'key': 'hot_folder', 'value': 'C:/Photobooth_Input'},
         {'key': 'trigger_key', 'value': '{F8}'},
-        {'key': 'staff_pin', 'value': os.environ.get('STAFF_PIN', '2606')},
+        {'key': 'staff_pin', 'value': os.environ.get('STAFF_PIN', '1310')},
         {'key': 'bill_port', 'value': 'COM3'},
         {'key': 'bill_baudrate', 'value': '9600'},
         {'key': 'bill_enabled', 'value': 'false'},
