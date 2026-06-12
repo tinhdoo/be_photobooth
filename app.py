@@ -29,7 +29,7 @@ from werkzeug.utils import secure_filename
 import pillow_heif
 pillow_heif.register_heif_opener()
 from PIL import Image, ImageOps
-from models import db, Session, Photo, Frame, PaymentCode, PaymentOrder, Device, Config, DeviceConfig, MobileUpload, BillCashEntry
+from models import db, Session, Photo, Frame, PaymentCode, PaymentOrder, Device, Config, DeviceConfig, MobileUpload, BillCashEntry, PrintJob
 import random
 import string
 import cloudinary
@@ -789,27 +789,65 @@ def print_photo():
 
     configured_name = request.form.get('printer_name') or get_config_value('printer_name', '')
     copies = request.form.get('copies', get_config_value('printer_copies', '1'))
+    try:
+        copies_int = max(1, min(int(copies or 1), 20))
+    except (TypeError, ValueError):
+        copies_int = 1
+    print_mode = request.form.get('print_mode') or 'grid_4x6'
+    cut_mode = request.form.get('cut_mode') or 'none'
+    session_uuid = request.form.get('session_id') or request.form.get('session_uuid')
     printer_name, printers = resolve_printer_name(configured_name)
+    print_job = PrintJob(
+        session_uuid=session_uuid,
+        printer_name=printer_name or configured_name,
+        copies=copies_int,
+        print_mode=print_mode,
+        cut_mode=cut_mode,
+        status='pending'
+    )
+    db.session.add(print_job)
+    db.session.commit()
 
     if not printer_name:
+        print_job.status = 'failed'
+        print_job.error_message = 'Printer not found'
+        db.session.commit()
         return jsonify({
             'error': 'Không tìm thấy máy in RX1HS trong Windows. Hãy cài driver DNP RX1HS và đặt tên printer có chứa RX1HS/DNP/RX1, hoặc cấu hình đúng printer_name.',
             'available_printers': printers,
-            'configured_printer': configured_name
+            'configured_printer': configured_name,
+            'job': print_job.to_dict()
         }), 500
 
     try:
         print_folder = os.path.join(os.getcwd(), 'uploads', 'print_jobs')
         saved_path = save_print_image(file, print_folder)
-        result = print_image_file(saved_path, printer_name, copies)
+        print_job.file_path = saved_path
+        print_job.printer_name = printer_name
+        db.session.commit()
+
+        result = print_image_file(saved_path, printer_name, copies_int)
+        print_job.status = 'sent'
+        db.session.commit()
         return jsonify({
             'success': True,
             'message': 'Đã gửi ảnh sang máy in.',
+            'job': print_job.to_dict(),
             **result
         }), 200
     except Exception as e:
         logging.exception("Print job failed")
-        return jsonify({'error': str(e), 'printer': printer_name}), 500
+        print_job.status = 'failed'
+        print_job.error_message = str(e)[:500]
+        db.session.commit()
+        return jsonify({'error': str(e), 'printer': printer_name, 'job': print_job.to_dict()}), 500
+
+
+@app.route('/api/print/jobs', methods=['GET'])
+def get_print_jobs():
+    limit = min(int(request.args.get('limit', 50) or 50), 200)
+    jobs = PrintJob.query.order_by(PrintJob.created_at.desc()).limit(limit).all()
+    return jsonify([job.to_dict() for job in jobs])
 
 # --- Payment Code APIs ---
 

@@ -205,6 +205,38 @@ class BillCashEntry(db.Model):
             'created_at': self.created_at.isoformat() if self.created_at else None
         }
 
+class PrintJob(db.Model):
+    __tablename__ = 'print_jobs'
+
+    id = db.Column(db.Integer, primary_key=True)
+    uuid = db.Column(db.String(36), unique=True, default=lambda: uuid.uuid4().hex)
+    session_uuid = db.Column(db.String(64), index=True, nullable=True)
+    file_path = db.Column(db.String(500), nullable=True)
+    printer_name = db.Column(db.String(255), nullable=True)
+    copies = db.Column(db.Integer, default=1)
+    print_mode = db.Column(db.String(32), default='grid_4x6')
+    cut_mode = db.Column(db.String(32), default='none')
+    status = db.Column(db.String(20), default='pending') # pending, sent, failed
+    error_message = db.Column(db.String(500), nullable=True)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(UTC), index=True)
+    updated_at = db.Column(db.DateTime, default=lambda: datetime.now(UTC), onupdate=lambda: datetime.now(UTC))
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'uuid': self.uuid,
+            'session_uuid': self.session_uuid,
+            'file_path': self.file_path,
+            'printer_name': self.printer_name,
+            'copies': self.copies,
+            'print_mode': self.print_mode,
+            'cut_mode': self.cut_mode,
+            'status': self.status,
+            'error_message': self.error_message,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None
+        }
+
 class Config(db.Model):
     __tablename__ = 'configs'
     
