@@ -3,7 +3,7 @@ logging.basicConfig(filename='app.log', level=logging.DEBUG, format='%(asctime)s
 logging.info("APP: STARTING UP...")
 
 print("APP: Importing libs...", flush=True)
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, send_file
 import os
 try:
     from dotenv import load_dotenv
@@ -900,6 +900,7 @@ def _session_staff_dict(session):
     latest_job = _latest_print_job(session.uuid)
     meta = session.meta_data or {}
     final_path = latest_job.file_path if latest_job else None
+    has_local_print_file = bool(final_path and os.path.exists(final_path))
     return {
         'id': session.id,
         'uuid': session.uuid,
@@ -915,7 +916,8 @@ def _session_staff_dict(session):
         'cutMode': latest_job.cut_mode if latest_job else meta.get('cut_mode'),
         'finalImageUrl': session.composite_url,
         'finalImagePath': final_path,
-        'canReprint': bool(final_path and os.path.exists(final_path)),
+        'previewUrl': session.composite_url or (f"/api/staff/sessions/{session.uuid}/print-image" if has_local_print_file else None),
+        'canReprint': has_local_print_file,
         'createdAt': session.created_at.isoformat() if session.created_at else None,
     }
 
@@ -988,6 +990,24 @@ def staff_reprint_session(session_uuid):
         print_job.error_message = str(e)[:500]
         db.session.commit()
         return jsonify({'error': str(e), 'job': print_job.to_dict()}), 500
+
+
+@app.route('/api/staff/sessions/<session_uuid>/print-image', methods=['GET'])
+def staff_session_print_image(session_uuid):
+    source_job = PrintJob.query.filter(
+        PrintJob.session_uuid == session_uuid,
+        PrintJob.file_path.isnot(None)
+    ).order_by(PrintJob.created_at.desc()).first()
+
+    if not source_job or not source_job.file_path:
+        return jsonify({'error': 'Không tìm thấy file in local của phiên này.'}), 404
+
+    path = os.path.abspath(source_job.file_path)
+    upload_root = os.path.abspath(os.path.join(os.getcwd(), 'uploads'))
+    if not path.startswith(upload_root + os.sep) or not os.path.exists(path):
+        return jsonify({'error': 'File in local không tồn tại hoặc không hợp lệ.'}), 404
+
+    return send_file(path, mimetype='image/jpeg')
 
 # --- Payment Code APIs ---
 
