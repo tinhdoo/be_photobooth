@@ -185,6 +185,26 @@ class PaymentOrder(db.Model):
             'expires_at': self.expires_at.isoformat() if self.expires_at else None
         }
 
+class BillCashEntry(db.Model):
+    __tablename__ = 'bill_cash_entries'
+
+    id = db.Column(db.Integer, primary_key=True)
+    device_id = db.Column(db.String(50), index=True, nullable=False)
+    amount = db.Column(db.Integer, nullable=False)
+    hex_code = db.Column(db.String(16), nullable=True)
+    business_date = db.Column(db.String(10), index=True, nullable=False)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(UTC), index=True)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'device_id': self.device_id,
+            'amount': self.amount,
+            'hex_code': self.hex_code,
+            'business_date': self.business_date,
+            'created_at': self.created_at.isoformat() if self.created_at else None
+        }
+
 class Config(db.Model):
     __tablename__ = 'configs'
     

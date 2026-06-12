@@ -2,7 +2,8 @@ import serial
 import threading
 import time
 import json
-from models import Config, DeviceConfig
+from datetime import datetime
+from models import db, BillCashEntry, Config, DeviceConfig
 
 class BillValidatorService:
     def __init__(self, app, socketio, device_id):
@@ -82,6 +83,18 @@ class BillValidatorService:
         self.mapping = new_mapping
         print(f"[Bill] Bill Mapping updated: {self.mapping}", flush=True)
 
+    def record_cash_entry(self, amount, hex_code):
+        with self.app.app_context():
+            entry = BillCashEntry(
+                device_id=self.device_id,
+                amount=int(amount),
+                hex_code=hex_code,
+                business_date=datetime.now().strftime('%Y-%m-%d')
+            )
+            db.session.add(entry)
+            db.session.commit()
+            return entry.to_dict()
+
     def _listen_loop(self):
         retry_count = 0
         while self.running:
@@ -127,9 +140,16 @@ class BillValidatorService:
                         if hex_val in self.mapping:
                             amount = int(self.mapping[hex_val])
                             print(f"[Bill] Valid Bill: {amount} VND", flush=True)
+                            entry = None
+                            try:
+                                entry = self.record_cash_entry(amount, hex_val)
+                            except Exception as log_error:
+                                print(f"[Bill] Cash history write failed: {log_error}", flush=True)
                             self.socketio.emit('money_inserted', {
                                 'device_id': self.device_id,
-                                'amount': amount
+                                'amount': amount,
+                                'hex': hex_val,
+                                'entry': entry
                             })
                         else:
                             print(f"[Bill] Unknown Hex: {hex_val}", flush=True)

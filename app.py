@@ -29,7 +29,7 @@ from werkzeug.utils import secure_filename
 import pillow_heif
 pillow_heif.register_heif_opener()
 from PIL import Image, ImageOps
-from models import db, Session, Photo, Frame, PaymentCode, PaymentOrder, Device, Config, DeviceConfig, MobileUpload
+from models import db, Session, Photo, Frame, PaymentCode, PaymentOrder, Device, Config, DeviceConfig, MobileUpload, BillCashEntry
 import random
 import string
 import cloudinary
@@ -1370,6 +1370,25 @@ def get_bill_status():
         'port': bill_service.port,
         'status': status,
         'device_id': get_device_id()
+    })
+
+@app.route('/api/bill/history', methods=['GET'])
+def get_bill_history():
+    device_id = request.args.get('device_id') or get_device_id()
+    business_date = request.args.get('date') or datetime.datetime.now().strftime('%Y-%m-%d')
+
+    entries = BillCashEntry.query.filter_by(
+        device_id=device_id,
+        business_date=business_date
+    ).order_by(BillCashEntry.created_at.desc()).all()
+
+    total = sum(entry.amount for entry in entries)
+    return jsonify({
+        'device_id': device_id,
+        'date': business_date,
+        'total': total,
+        'count': len(entries),
+        'entries': [entry.to_dict() for entry in entries]
     })
 
 @app.route('/api/bill/ports', methods=['GET'])
