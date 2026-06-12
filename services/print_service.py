@@ -62,6 +62,52 @@ def resolve_printer_name(configured_name=None):
     return None, printers
 
 
+def get_printer_status(configured_name=None):
+    printer_name, printers = resolve_printer_name(configured_name)
+    status = {
+        "online": bool(printer_name),
+        "name": printer_name,
+        "configured_name": configured_name or "",
+        "available_printers": printers,
+        "status": "Online" if printer_name else "Not found",
+        "paper": "4x6",
+        "remaining": None,
+        "remaining_label": "Không đọc được từ driver",
+        "driver": "Unknown",
+        "message": "Đã kết nối" if printer_name else "Không tìm thấy máy in",
+    }
+
+    if not printer_name or os.name != "nt":
+        return status
+
+    try:
+        ps_command = (
+            f"$p = Get-Printer -Name {printer_name!r} -ErrorAction Stop; "
+            "$p | Select-Object Name,PrinterStatus,DriverName | ConvertTo-Json -Compress"
+        )
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_command],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            import json
+
+            info = json.loads(result.stdout)
+            printer_status = str(info.get("PrinterStatus") or "").strip()
+            driver_name = str(info.get("DriverName") or "").strip()
+            status["status"] = printer_status or status["status"]
+            status["driver"] = driver_name or status["driver"]
+            status["online"] = printer_status.lower() not in {"offline", "error", "not available"}
+            status["message"] = "Đã kết nối" if status["online"] else printer_status or "Máy in không sẵn sàng"
+    except Exception:
+        pass
+
+    return status
+
+
 def save_print_image(file_storage, output_dir):
     os.makedirs(output_dir, exist_ok=True)
     raw = file_storage.read()
@@ -99,3 +145,30 @@ def print_image_file(image_path, printer_name, copies=1):
         "copies": copies,
         "file_path": image_path,
     }
+
+
+def create_test_print_image(output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, f"test_print_{time.strftime('%Y%m%d_%H%M%S')}.jpg")
+    image = Image.new("RGB", (1200, 1800), "#fff6df")
+
+    try:
+        from PIL import ImageDraw, ImageFont
+
+        draw = ImageDraw.Draw(image)
+        font_large = ImageFont.truetype("arial.ttf", 72)
+        font_medium = ImageFont.truetype("arial.ttf", 42)
+    except Exception:
+        from PIL import ImageDraw
+
+        draw = ImageDraw.Draw(image)
+        font_large = None
+        font_medium = None
+
+    draw.rectangle((80, 80, 1120, 1720), outline="#8b6a4b", width=8)
+    draw.text((160, 260), "Tomato Photobooth", fill="#2f3e46", font=font_large)
+    draw.text((160, 380), "DNP RX1HS test print", fill="#52796f", font=font_medium)
+    draw.text((160, 480), time.strftime("%Y-%m-%d %H:%M:%S"), fill="#8b6a4b", font=font_medium)
+    draw.text((160, 1560), "If this prints cleanly, printer path is ready.", fill="#2f3e46", font=font_medium)
+    image.save(path, "JPEG", quality=95, subsampling=0)
+    return path

@@ -41,7 +41,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 import atexit
 # Import cleanup manager (will be created next)
 from services.cleanup_manager import cleanup_expired_sessions, cleanup_old_local_upload_files, cleanup_old_payment_codes, expire_session_if_needed
-from services.print_service import get_available_printers, print_image_file, resolve_printer_name, save_print_image
+from services.print_service import create_test_print_image, get_available_printers, get_printer_status, print_image_file, resolve_printer_name, save_print_image
 from services.supabase_storage import is_supabase_configured, upload_file_to_supabase, upload_path_to_supabase
 
 # Khởi tạo App
@@ -661,6 +661,121 @@ def list_printers():
         'configured_printer': configured_name,
         'resolved_printer': resolved_name
     }), 200
+
+
+def check_internet_status():
+    import socket
+    try:
+        with socket.create_connection(("1.1.1.1", 53), timeout=2):
+            return {"online": True, "message": "Online"}
+    except Exception as exc:
+        return {"online": False, "message": str(exc)}
+
+
+def check_supabase_status():
+    if not is_supabase_configured():
+        return {"online": False, "configured": False, "message": "Chưa cấu hình Supabase"}
+
+    try:
+        import urllib.request
+
+        url = os.environ.get("SUPABASE_URL", "").rstrip("/") + "/rest/v1/"
+        req = urllib.request.Request(
+            url,
+            headers={
+                "apikey": os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_KEY"),
+                "Authorization": "Bearer " + (os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_KEY")),
+            },
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=4) as res:
+            return {"online": 200 <= res.status < 500, "configured": True, "message": f"HTTP {res.status}"}
+    except Exception as exc:
+        return {"online": False, "configured": True, "message": str(exc)}
+
+
+def get_camera_status():
+    mode = get_config_value('camera_mode', 'webcam')
+    hot_folder = get_config_value('hot_folder', 'C:/Photobooth_Input')
+
+    if mode == 'hotfolder':
+        exists = os.path.isdir(hot_folder)
+        return {
+            "online": exists,
+            "mode": mode,
+            "name": "Hot folder / EOS Utility",
+            "message": "Đã sẵn sàng" if exists else f"Không tìm thấy thư mục {hot_folder}",
+            "hot_folder": hot_folder,
+            "browser_check_required": False,
+        }
+
+    if mode == 'canon':
+        return {
+            "online": None,
+            "mode": mode,
+            "name": "Canon middleware",
+            "message": "Cần kiểm tra qua middleware Canon trên máy local",
+            "browser_check_required": False,
+        }
+
+    return {
+        "online": None,
+        "mode": mode,
+        "name": "Webcam / USB camera",
+        "message": "Cần kiểm tra quyền camera trên trình duyệt",
+        "browser_check_required": True,
+    }
+
+
+@app.route('/api/hardware/status', methods=['GET'])
+def hardware_status():
+    printer = get_printer_status(get_config_value('printer_name', ''))
+    camera = get_camera_status()
+    internet = check_internet_status()
+    supabase = check_supabase_status()
+
+    checks = {
+        "printer": bool(printer.get("online")),
+        "camera": camera.get("online") is True,
+        "internet": bool(internet.get("online")),
+        "supabase": bool(supabase.get("online")),
+    }
+
+    return jsonify({
+        "ok": all(checks.values()),
+        "checks": checks,
+        "printer": printer,
+        "camera": camera,
+        "internet": internet,
+        "supabase": supabase,
+    }), 200
+
+
+@app.route('/api/printer/test', methods=['POST'])
+def test_printer():
+    configured_name = request.json.get('printer_name') if request.is_json and request.json else None
+    configured_name = configured_name or get_config_value('printer_name', '')
+    printer_name, printers = resolve_printer_name(configured_name)
+
+    if not printer_name:
+        return jsonify({
+            'error': 'Không tìm thấy máy in',
+            'available_printers': printers,
+            'configured_printer': configured_name
+        }), 500
+
+    try:
+        print_folder = os.path.join(os.getcwd(), 'uploads', 'print_jobs')
+        test_path = create_test_print_image(print_folder)
+        result = print_image_file(test_path, printer_name, 1)
+        return jsonify({
+            'success': True,
+            'message': 'Đã gửi lệnh in thử.',
+            **result
+        }), 200
+    except Exception as e:
+        logging.exception("Test print failed")
+        return jsonify({'error': str(e), 'printer': printer_name}), 500
 
 
 @app.route('/api/print', methods=['POST'])
