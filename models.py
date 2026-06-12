@@ -120,6 +120,7 @@ class MobileUpload(db.Model):
 
     id = db.Column(db.Integer, primary_key=True)
     session_uuid = db.Column(db.String(64), index=True, nullable=False)
+    slot_index = db.Column(db.Integer, nullable=True)
     url = db.Column(db.String(500), nullable=False)
     public_id = db.Column(db.String(150), nullable=True)
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(UTC))
@@ -128,6 +129,7 @@ class MobileUpload(db.Model):
         return {
             'id': self.id,
             'session_uuid': self.session_uuid,
+            'slot_index': self.slot_index,
             'url': self.url,
             'public_id': self.public_id,
             'created_at': self.created_at.isoformat()

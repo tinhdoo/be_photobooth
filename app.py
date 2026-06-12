@@ -154,6 +154,9 @@ def ensure_runtime_schema():
     columns_to_add = {
         'photos': {
             'video_public_id': 'VARCHAR(100)'
+        },
+        'mobile_uploads': {
+            'slot_index': 'INTEGER'
         }
     }
 
@@ -466,12 +469,43 @@ def upload_mobile():
         return jsonify({'error': 'No file part'}), 400
     file = request.files['file']
     session_id = request.form.get('session_id') # Identify which photobooth session this is for
+    expected_count = request.form.get('expected_count', '0')
+    slot_index = request.form.get('slot_index')
     
     if file.filename == '':
         return jsonify({'error': 'No selected file'}), 400
     
     if not session_id:
         return jsonify({'error': 'No session_id provided'}), 400
+
+    try:
+        expected_count = max(1, min(int(expected_count or 0), 12))
+    except (TypeError, ValueError):
+        expected_count = 0
+
+    try:
+        slot_index = int(slot_index) if slot_index is not None else None
+    except (TypeError, ValueError):
+        slot_index = None
+
+    if slot_index is not None:
+        existing_slot = MobileUpload.query.filter_by(session_uuid=session_id, slot_index=slot_index).first()
+        if existing_slot:
+            return jsonify({
+                'success': True,
+                'duplicate': True,
+                'url': existing_slot.url,
+                'public_id': existing_slot.public_id,
+                'upload': existing_slot.to_dict()
+            }), 200
+
+    if expected_count:
+        current_count = MobileUpload.query.filter_by(session_uuid=session_id).count()
+        if current_count >= expected_count:
+            return jsonify({
+                'error': f'Phiên này đã nhận đủ {expected_count} ảnh.',
+                'code': 'SESSION_FULL'
+            }), 409
 
     try:
         # Save to temp folder (Processed with Pillow)
@@ -489,10 +523,10 @@ def upload_mobile():
         img = img.convert("RGB")
         
         # Resize to a max bounding box (e.g., 1800x1800) to save RAM and Kiosk display performance
-        img.thumbnail((1800, 1800))
+        img.thumbnail((1600, 1600))
         
         # Save as optimized JPEG
-        img.save(dest_path, "JPEG", quality=90)
+        img.save(dest_path, "JPEG", quality=88, optimize=True)
         
         # URL tương đối để proxy của Vite tự forward tải ảnh đúng IP
         local_url = f"/uploads/temp/{new_filename}"
@@ -507,13 +541,13 @@ def upload_mobile():
             except Exception as upload_error:
                 logging.warning(f"Mobile Supabase upload failed; using local temp file: {upload_error}")
 
-        mobile_upload = MobileUpload(session_uuid=session_id, url=final_url, public_id=public_id)
+        mobile_upload = MobileUpload(session_uuid=session_id, slot_index=slot_index, url=final_url, public_id=public_id)
         db.session.add(mobile_upload)
         db.session.commit()
 
-        socketio.emit('mobile_photo_uploaded', {'session_id': session_id, 'url': final_url})
+        socketio.emit('mobile_photo_uploaded', {'session_id': session_id, 'url': final_url, 'slot_index': slot_index})
         
-        return jsonify({'success': True, 'url': final_url, 'public_id': public_id}), 200
+        return jsonify({'success': True, 'url': final_url, 'public_id': public_id, 'upload': mobile_upload.to_dict()}), 200
     except Exception as e:
         db.session.rollback()
         print(f"Mobile upload error: {e}", flush=True)
@@ -522,7 +556,7 @@ def upload_mobile():
 
 @app.route('/api/mobile-uploads/<session_id>', methods=['GET'])
 def get_mobile_uploads(session_id):
-    uploads = MobileUpload.query.filter_by(session_uuid=session_id).order_by(MobileUpload.created_at.asc()).all()
+    uploads = MobileUpload.query.filter_by(session_uuid=session_id).order_by(MobileUpload.slot_index.asc().nullslast(), MobileUpload.created_at.asc()).all()
     return jsonify([item.to_dict() for item in uploads]), 200
 
 @app.route('/api/network/ip', methods=['GET'])
