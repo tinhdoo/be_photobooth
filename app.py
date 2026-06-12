@@ -886,6 +886,109 @@ def get_print_jobs():
     jobs = PrintJob.query.order_by(PrintJob.created_at.desc()).limit(limit).all()
     return jsonify([job.to_dict() for job in jobs])
 
+
+def _session_display_id(session):
+    created = session.created_at or datetime.datetime.now(UTC)
+    return f"S{created.strftime('%y%m%d')}-{session.id:03d}"
+
+
+def _latest_print_job(session_uuid):
+    return PrintJob.query.filter_by(session_uuid=session_uuid).order_by(PrintJob.created_at.desc()).first()
+
+
+def _session_staff_dict(session):
+    latest_job = _latest_print_job(session.uuid)
+    meta = session.meta_data or {}
+    final_path = latest_job.file_path if latest_job else None
+    return {
+        'id': session.id,
+        'uuid': session.uuid,
+        'sessionId': _session_display_id(session),
+        'layout': session.layout_id,
+        'amount': session.amount or 0,
+        'paymentMethod': session.payment_method,
+        'paymentStatus': 'paid' if session.payment_method else 'unknown',
+        'printStatus': latest_job.status if latest_job else 'not_printed',
+        'printError': latest_job.error_message if latest_job else None,
+        'copies': latest_job.copies if latest_job else meta.get('printer_copies') or meta.get('print_quantity') or 1,
+        'printMode': latest_job.print_mode if latest_job else meta.get('print_mode'),
+        'cutMode': latest_job.cut_mode if latest_job else meta.get('cut_mode'),
+        'finalImageUrl': session.composite_url,
+        'finalImagePath': final_path,
+        'canReprint': bool(final_path and os.path.exists(final_path)),
+        'createdAt': session.created_at.isoformat() if session.created_at else None,
+    }
+
+
+@app.route('/api/staff/sessions/recent', methods=['GET'])
+def staff_recent_sessions():
+    limit = min(max(int(request.args.get('limit', 30) or 30), 1), 100)
+    sessions = Session.query.order_by(Session.created_at.desc()).limit(limit).all()
+    return jsonify([_session_staff_dict(session) for session in sessions])
+
+
+@app.route('/api/staff/sessions/<session_uuid>/reprint', methods=['POST'])
+def staff_reprint_session(session_uuid):
+    data = request.get_json(silent=True) or {}
+    try:
+        copies = max(1, min(int(data.get('copies') or 1), 20))
+    except (TypeError, ValueError):
+        copies = 1
+
+    session = Session.query.filter_by(uuid=session_uuid).first()
+    if not session:
+        return jsonify({'error': 'Không tìm thấy phiên chụp.'}), 404
+
+    source_job = PrintJob.query.filter(
+        PrintJob.session_uuid == session_uuid,
+        PrintJob.file_path.isnot(None)
+    ).order_by(PrintJob.created_at.desc()).first()
+
+    if not source_job or not source_job.file_path or not os.path.exists(source_job.file_path):
+        return jsonify({'error': 'Không tìm thấy file in local của phiên này.'}), 404
+
+    configured_name = data.get('printer_name') or get_config_value('printer_name', '')
+    printer_name, printers = resolve_printer_name(configured_name)
+    print_job = PrintJob(
+        session_uuid=session_uuid,
+        file_path=source_job.file_path,
+        printer_name=printer_name or configured_name,
+        copies=copies,
+        print_mode=source_job.print_mode,
+        cut_mode=source_job.cut_mode,
+        status='pending'
+    )
+    db.session.add(print_job)
+    db.session.commit()
+
+    if not printer_name:
+        print_job.status = 'failed'
+        print_job.error_message = 'Printer not found'
+        db.session.commit()
+        return jsonify({
+            'error': 'Không tìm thấy máy in RX1HS trong Windows.',
+            'available_printers': printers,
+            'job': print_job.to_dict()
+        }), 500
+
+    try:
+        result = print_image_file(source_job.file_path, printer_name, copies)
+        print_job.status = 'sent'
+        print_job.printer_name = printer_name
+        db.session.commit()
+        return jsonify({
+            'success': True,
+            'message': 'Đã gửi lệnh in lại.',
+            'job': print_job.to_dict(),
+            **result
+        }), 200
+    except Exception as e:
+        logging.exception("Staff reprint failed")
+        print_job.status = 'failed'
+        print_job.error_message = str(e)[:500]
+        db.session.commit()
+        return jsonify({'error': str(e), 'job': print_job.to_dict()}), 500
+
 # --- Payment Code APIs ---
 
 @app.route('/api/codes/generate', methods=['POST'])
@@ -1273,6 +1376,7 @@ def init_configs():
         {'key': 'camera_mode', 'value': 'webcam'}, # webcam, hotfolder
         {'key': 'hot_folder', 'value': 'C:/Photobooth_Input'},
         {'key': 'trigger_key', 'value': '{F8}'},
+        {'key': 'staff_pin', 'value': os.environ.get('STAFF_PIN', '2606')},
         {'key': 'bill_port', 'value': 'COM3'},
         {'key': 'bill_baudrate', 'value': '9600'},
         {'key': 'bill_enabled', 'value': 'false'},
