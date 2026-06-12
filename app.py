@@ -368,11 +368,14 @@ def delete_frame(layout, filename):
         # Delete file
         file_path = os.path.join(app.config['UPLOAD_FOLDER'], layout, filename)
         config_path = os.path.join(app.config['UPLOAD_FOLDER'], layout, f"{filename}.json")
+        icon_path = os.path.join(app.config['UPLOAD_FOLDER'], 'icons', layout, frame.icon_path) if frame.icon_path else None
         
         if os.path.exists(file_path):
             os.remove(file_path)
         if os.path.exists(config_path):
             os.remove(config_path)
+        if icon_path and os.path.exists(icon_path):
+            os.remove(icon_path)
             
         db.session.delete(frame)
         db.session.commit()
