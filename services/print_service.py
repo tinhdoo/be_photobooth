@@ -4,7 +4,7 @@ import time
 import uuid
 from io import BytesIO
 
-from PIL import Image, ImageOps
+from PIL import Image, ImageEnhance, ImageOps
 
 
 PREFERRED_PRINTER_KEYWORDS = ("RX1HS", "DS-RX1", "RX1", "DNP")
@@ -147,7 +147,35 @@ def print_image_file(image_path, printer_name, copies=1):
     }
 
 
-def create_test_print_image(output_dir):
+def _number_setting(settings, key, default=0):
+    try:
+        return float((settings or {}).get(key, default) or default)
+    except Exception:
+        return float(default)
+
+
+def apply_basic_print_color_settings(image, settings=None):
+    brightness = _number_setting(settings, "print_brightness")
+    contrast = _number_setting(settings, "print_contrast")
+    saturation = _number_setting(settings, "print_saturation")
+    warmth = _number_setting(settings, "print_warmth")
+
+    if brightness:
+        image = ImageEnhance.Brightness(image).enhance(max(0.2, 1 + brightness / 100))
+    if contrast:
+        image = ImageEnhance.Contrast(image).enhance(max(0.2, 1 + contrast / 100))
+    if saturation:
+        image = ImageEnhance.Color(image).enhance(max(0.2, 1 + saturation / 100))
+    if warmth:
+        r, g, b = image.split()
+        r = r.point(lambda value: max(0, min(255, value + warmth)))
+        b = b.point(lambda value: max(0, min(255, value - warmth)))
+        image = Image.merge("RGB", (r, g, b))
+
+    return image
+
+
+def create_test_print_image(output_dir, color_settings=None):
     os.makedirs(output_dir, exist_ok=True)
     path = os.path.join(output_dir, f"test_print_{time.strftime('%Y%m%d_%H%M%S')}.jpg")
     image = Image.new("RGB", (1200, 1800), "#fff6df")
@@ -169,6 +197,11 @@ def create_test_print_image(output_dir):
     draw.text((160, 260), "Tomato Photobooth", fill="#2f3e46", font=font_large)
     draw.text((160, 380), "DNP RX1HS test print", fill="#52796f", font=font_medium)
     draw.text((160, 480), time.strftime("%Y-%m-%d %H:%M:%S"), fill="#8b6a4b", font=font_medium)
+    draw.rectangle((160, 620, 460, 920), fill="#f2c7bd")
+    draw.rectangle((500, 620, 800, 920), fill="#f7dccd")
+    draw.rectangle((840, 620, 980, 920), fill="#ffffff")
+    draw.text((160, 980), "Color calibration sample", fill="#8b6a4b", font=font_medium)
     draw.text((160, 1560), "If this prints cleanly, printer path is ready.", fill="#2f3e46", font=font_medium)
+    image = apply_basic_print_color_settings(image, color_settings)
     image.save(path, "JPEG", quality=95, subsampling=0)
     return path

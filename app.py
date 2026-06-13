@@ -790,7 +790,8 @@ def hardware_status():
 
 @app.route('/api/printer/test', methods=['POST'])
 def test_printer():
-    configured_name = request.json.get('printer_name') if request.is_json and request.json else None
+    payload = request.json if request.is_json and request.json else {}
+    configured_name = payload.get('printer_name')
     configured_name = configured_name or get_config_value('printer_name', '')
     printer_name, printers = resolve_printer_name(configured_name)
 
@@ -803,7 +804,13 @@ def test_printer():
 
     try:
         print_folder = os.path.join(os.getcwd(), 'uploads', 'print_jobs')
-        test_path = create_test_print_image(print_folder)
+        color_settings = {
+            'print_brightness': payload.get('print_brightness', get_config_value('print_brightness', '0')),
+            'print_contrast': payload.get('print_contrast', get_config_value('print_contrast', '0')),
+            'print_saturation': payload.get('print_saturation', get_config_value('print_saturation', '0')),
+            'print_warmth': payload.get('print_warmth', get_config_value('print_warmth', '2')),
+        }
+        test_path = create_test_print_image(print_folder, color_settings)
         result = print_image_file(test_path, printer_name, 1)
         return jsonify({
             'success': True,
@@ -1393,6 +1400,12 @@ def init_configs():
         {'key': 'mobile_print_price', 'value': '10000'},
         {'key': 'printer_name', 'value': os.environ.get('PRINTER_NAME', 'RX1HS')},
         {'key': 'printer_copies', 'value': '1'},
+        {'key': 'print_brightness', 'value': '0'},
+        {'key': 'print_contrast', 'value': '0'},
+        {'key': 'print_saturation', 'value': '0'},
+        {'key': 'print_pink', 'value': '8'},
+        {'key': 'print_skin_whitening', 'value': '6'},
+        {'key': 'print_warmth', 'value': '2'},
         {'key': 'camera_mode', 'value': 'webcam'}, # webcam, hotfolder
         {'key': 'hot_folder', 'value': 'C:/Photobooth_Input'},
         {'key': 'trigger_key', 'value': '{F8}'},
