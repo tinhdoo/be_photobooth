@@ -1,6 +1,15 @@
 import eventlet
 eventlet.monkey_patch()
 
+# Console Windows mặc định cp1252 không encode được tiếng Việt -> mọi print có dấu sẽ
+# crash (UnicodeEncodeError). Đặt errors='replace' để in an toàn, không bao giờ vỡ luồng.
+import sys as _sys
+for _stream in (_sys.stdout, _sys.stderr):
+    try:
+        _stream.reconfigure(errors='replace')
+    except Exception:
+        pass
+
 import logging
 logging.basicConfig(filename='app.log', level=logging.DEBUG, format='%(asctime)s %(levelname)s: %(message)s')
 logging.info("APP: STARTING UP...")
@@ -2112,9 +2121,9 @@ def push_booth_report_to_cloud():
             'business_date': yesterday,
         }
         requests.post(f"{cloud_url}/api/devices", json=payload, timeout=15)
-        print(f"[BoothReport] Đã gửi: giấy={paper}, tiền mặt {yesterday}={cash_total} ({cash_count} lần)", flush=True)
+        print(f"[BoothReport] Sent: paper={paper}, cash {yesterday}={cash_total} ({cash_count})", flush=True)
     except Exception as e:
-        print(f"[BoothReport] Gửi báo cáo thất bại: {e}", flush=True)
+        print(f"[BoothReport] Report failed: {e}", flush=True)
 
 
 # Startup Init
