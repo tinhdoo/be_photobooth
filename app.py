@@ -1,3 +1,6 @@
+import eventlet
+eventlet.monkey_patch()
+
 import logging
 logging.basicConfig(filename='app.log', level=logging.DEBUG, format='%(asctime)s %(levelname)s: %(message)s')
 logging.info("APP: STARTING UP...")
@@ -7,6 +10,7 @@ from flask import Flask, request, jsonify, send_from_directory, send_file
 import os
 try:
     from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.getcwd(), '.env'))
     load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
 except ImportError:
     pass
@@ -24,7 +28,8 @@ import uuid
 import json
 import cv2
 import hmac
-from urllib.parse import urlencode
+import urllib.request
+from urllib.parse import urlencode, urlparse, unquote
 from werkzeug.utils import secure_filename
 import pillow_heif
 pillow_heif.register_heif_opener()
@@ -64,9 +69,24 @@ cloudinary.config(
 
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
+def get_frontend_dist_dir():
+    candidates = [
+        os.environ.get('FRONTEND_DIST_DIR'),
+        os.path.join(os.getcwd(), 'dist'),
+        os.path.join(os.path.dirname(__file__), 'dist'),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'dev_fe', 'photobooth_fe', 'dist'),
+    ]
+    for candidate in candidates:
+        if candidate and os.path.exists(os.path.join(candidate, 'index.html')):
+            return os.path.abspath(candidate)
+    return None
+
 db.init_app(app)
 # Initialize SocketIO correctly
-socketio = SocketIO(app, cors_allowed_origins="*")
+# Default to eventlet (we monkey_patch eventlet at the top); the bundled exe would
+# otherwise auto-fall back to the threading/Werkzeug server, which refuses to run.
+socketio_async_mode = os.environ.get("SOCKETIO_ASYNC_MODE") or "eventlet"
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode=socketio_async_mode)
 
 @app.errorhandler(413)
 def request_entity_too_large(error):
@@ -172,6 +192,9 @@ def ensure_runtime_schema():
 
 @app.route('/')
 def index():
+    dist_dir = get_frontend_dist_dir()
+    if dist_dir:
+        return send_from_directory(dist_dir, 'index.html')
     return "Photobooth Backend Running (with SQLite)"
 
 @app.route('/uploads/<path:filename>')
@@ -580,6 +603,7 @@ def get_lan_ip():
 
 
 @app.route('/api/upload/cloud', methods=['POST'])
+@app.route('/api/upload-cloud', methods=['POST'])
 def upload_cloud():
     if 'file' not in request.files:
         return jsonify({'error': 'No file part'}), 400
@@ -647,9 +671,110 @@ def upload_cloud():
             logging.exception("Cloudinary and local upload both failed")
             return jsonify({'error': f'Upload failed: {str(e)}; local fallback failed: {str(local_error)}'}), 500
 
+
+# --- Local PUT Upload Fallback for Branding ---
+@app.route('/api/upload/local-put/<key>/<filename>', methods=['PUT'])
+def local_put_upload(key, filename):
+    try:
+        branding_folder = os.path.join(app.config['UPLOAD_FOLDER'], '..', 'branding')
+        os.makedirs(branding_folder, exist_ok=True)
+        dest_path = os.path.join(branding_folder, f"branding_{key}-{filename}")
+        
+        if request.files:
+            file = request.files.get('') or list(request.files.values())[0]
+            file.save(dest_path)
+        else:
+            with open(dest_path, 'wb') as f:
+                f.write(request.data)
+                
+        local_url = f"/uploads/branding/branding_{key}-{filename}"
+        return jsonify({'success': True, 'url': local_url}), 200
+    except Exception as e:
+        logging.error(f"Local PUT upload failed: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
 # --- Branding Upload API ---
 @app.route('/api/upload/branding', methods=['POST'])
+@app.route('/api/upload-branding', methods=['POST'])
 def upload_branding():
+    # If the request content-type is JSON (the Vercel-style prepare/finalize flow)
+    if request.is_json:
+        data = request.json
+        action = data.get('action')
+        key = data.get('key')
+        if not key:
+            return jsonify({'error': 'Missing config key'}), 400
+
+        import re
+        key = re.sub(r'[^a-zA-Z0-9_-]', '', str(key))[:80]
+
+        if action == 'prepare':
+            filename = secure_filename(data.get('filename', 'branding'))
+            name, ext = os.path.splitext(filename)
+            unique_id = uuid.uuid4().hex
+            object_path = f"branding/{key}-{unique_id}{ext.lower()}"
+
+            if is_supabase_configured():
+                try:
+                    from services.supabase_storage import _create_client
+                    client = _create_client()
+                    bucket = os.environ.get("SUPABASE_BUCKET")
+                    res = client.storage.from_(bucket).create_signed_upload_url(object_path, {"expiresIn": 3600})
+                    return jsonify({
+                        'bucket': bucket,
+                        'objectPath': object_path,
+                        'signedUrl': res.get('signed_url') or res.get('signedUrl'),
+                        'token': res.get('token')
+                    }), 200
+                except Exception as supabase_err:
+                    logging.warning(f"Supabase signed URL creation failed, falling back to local: {supabase_err}")
+
+            signed_url = f"{request.host_url.rstrip('/')}/api/upload/local-put/{key}/{unique_id}{ext.lower()}"
+            return jsonify({
+                'bucket': 'local',
+                'objectPath': object_path,
+                'signedUrl': signed_url,
+                'token': 'local'
+            }), 200
+
+        elif action == 'finalize':
+            object_path = data.get('objectPath', '')
+            if not object_path or not object_path.startswith(f"branding/{key}-"):
+                return jsonify({'error': 'Invalid object path'}), 400
+
+            parts = object_path.split('/')
+            filename = parts[-1]
+            
+            branding_folder = os.path.join(app.config['UPLOAD_FOLDER'], '..', 'branding')
+            local_file_name = f"branding_{filename}"
+            local_path = os.path.join(branding_folder, local_file_name)
+            
+            if os.path.exists(local_path):
+                url = f"/uploads/branding/{local_file_name}"
+            else:
+                if is_supabase_configured():
+                    bucket = os.environ.get("SUPABASE_BUCKET")
+                    url = f"{os.environ.get('SUPABASE_URL').rstrip('/')}/storage/v1/object/public/{bucket}/{object_path}"
+                else:
+                    return jsonify({'error': 'Uploaded file not found'}), 404
+
+            config = db.session.get(Config, key)
+            if config:
+                config.value = url
+            else:
+                db.session.add(Config(key=key, value=url))
+            db.session.commit()
+
+            return jsonify({
+                'success': True,
+                'key': key,
+                'url': url
+            }), 200
+
+        return jsonify({'error': 'Invalid upload action'}), 400
+
+    # Multipart form-data fallback (original logic)
     if 'file' not in request.files:
         return jsonify({'error': 'No file part'}), 400
     file = request.files['file']
@@ -811,7 +936,21 @@ def test_printer():
             'print_warmth': payload.get('print_warmth', get_config_value('print_warmth', '2')),
         }
         test_path = create_test_print_image(print_folder, color_settings)
-        result = print_image_file(test_path, printer_name, 1)
+        
+        scale_x = get_int_config('print_scale_x', 100)
+        scale_y = get_int_config('print_scale_y', 100)
+        offset_x = get_int_config('print_offset_x', 0)
+        offset_y = get_int_config('print_offset_y', 0)
+
+        result = print_image_file(
+            test_path, 
+            printer_name, 
+            1, 
+            scale_x=scale_x, 
+            scale_y=scale_y, 
+            offset_x=offset_x, 
+            offset_y=offset_y
+        )
         return jsonify({
             'success': True,
             'message': 'Đã gửi lệnh in thử.',
@@ -865,12 +1004,26 @@ def print_photo():
 
     try:
         print_folder = os.path.join(os.getcwd(), 'uploads', 'print_jobs')
-        saved_path = save_print_image(file, print_folder)
+        saved_path = save_print_image(file, print_folder, sharpen=get_int_config('print_sharpen', 70))
         print_job.file_path = saved_path
         print_job.printer_name = printer_name
         db.session.commit()
 
-        result = print_image_file(saved_path, printer_name, copies_int)
+        scale_x = get_int_config('print_scale_x', 100)
+        scale_y = get_int_config('print_scale_y', 100)
+        offset_x = get_int_config('print_offset_x', 0)
+        offset_y = get_int_config('print_offset_y', 0)
+
+        result = print_image_file(
+            saved_path, 
+            printer_name, 
+            copies_int, 
+            cut_mode=cut_mode,
+            scale_x=scale_x,
+            scale_y=scale_y,
+            offset_x=offset_x,
+            offset_y=offset_y
+        )
         print_job.status = 'sent'
         db.session.commit()
         return jsonify({
@@ -903,11 +1056,57 @@ def _latest_print_job(session_uuid):
     return PrintJob.query.filter_by(session_uuid=session_uuid).order_by(PrintJob.created_at.desc()).first()
 
 
+def _local_upload_path_from_url(url):
+    if not url:
+        return None
+
+    parsed = urlparse(url)
+    path = unquote(parsed.path if parsed.scheme else url)
+    if not path.startswith('/uploads/'):
+        return None
+
+    candidate = os.path.abspath(os.path.join(os.getcwd(), path.lstrip('/').replace('/', os.sep)))
+    upload_root = os.path.abspath(os.path.join(os.getcwd(), 'uploads'))
+    if candidate.startswith(upload_root + os.sep) and os.path.exists(candidate):
+        return candidate
+    return None
+
+
+def _materialize_session_print_file(session):
+    if not session.composite_url:
+        return None
+
+    print_folder = os.path.join(os.getcwd(), 'uploads', 'print_jobs')
+    os.makedirs(print_folder, exist_ok=True)
+
+    local_source = _local_upload_path_from_url(session.composite_url)
+    if local_source:
+        image = Image.open(local_source)
+    else:
+        request_url = session.composite_url
+        if request_url.startswith('//'):
+            request_url = f"https:{request_url}"
+        if not urlparse(request_url).scheme:
+            raise RuntimeError('Session image URL is not valid for restore.')
+
+        req = urllib.request.Request(request_url, headers={'User-Agent': 'TomatoPhotobooth/1.0'})
+        with urllib.request.urlopen(req, timeout=20) as response:
+            image = Image.open(response)
+            image.load()
+
+    image = ImageOps.exif_transpose(image).convert('RGB')
+    filename = secure_filename(f"reprint_{session.uuid}_{uuid.uuid4().hex[:8]}.jpg")
+    path = os.path.join(print_folder, filename)
+    image.save(path, 'JPEG', quality=95, subsampling=0)
+    return path
+
+
 def _session_staff_dict(session):
     latest_job = _latest_print_job(session.uuid)
     meta = session.meta_data or {}
     final_path = latest_job.file_path if latest_job else None
     has_local_print_file = bool(final_path and os.path.exists(final_path))
+    can_reprint = has_local_print_file or bool(session.composite_url)
     return {
         'id': session.id,
         'uuid': session.uuid,
@@ -924,7 +1123,7 @@ def _session_staff_dict(session):
         'finalImageUrl': session.composite_url,
         'finalImagePath': final_path,
         'previewUrl': session.composite_url or (f"/api/staff/sessions/{session.uuid}/print-image" if has_local_print_file else None),
-        'canReprint': has_local_print_file,
+        'canReprint': can_reprint,
         'createdAt': session.created_at.isoformat() if session.created_at else None,
     }
 
@@ -946,25 +1145,37 @@ def staff_reprint_session(session_uuid):
 
     session = Session.query.filter_by(uuid=session_uuid).first()
     if not session:
-        return jsonify({'error': 'Không tìm thấy phiên chụp.'}), 404
+        return jsonify({'error': 'Khong tim thay phien chup.'}), 404
 
     source_job = PrintJob.query.filter(
         PrintJob.session_uuid == session_uuid,
         PrintJob.file_path.isnot(None)
     ).order_by(PrintJob.created_at.desc()).first()
 
-    if not source_job or not source_job.file_path or not os.path.exists(source_job.file_path):
-        return jsonify({'error': 'Không tìm thấy file in local của phiên này.'}), 404
+    source_path = source_job.file_path if source_job and source_job.file_path and os.path.exists(source_job.file_path) else None
+    if not source_path:
+        try:
+            source_path = _materialize_session_print_file(session)
+        except Exception as e:
+            logging.exception("Could not restore print file for staff reprint")
+            return jsonify({'error': f'Khong tai lai duoc file in cua phien nay: {str(e)}'}), 404
+
+    if not source_path or not os.path.exists(source_path):
+        return jsonify({'error': 'Khong tim thay file in cua phien nay.'}), 404
+
+    meta = session.meta_data or {}
+    print_mode = source_job.print_mode if source_job else meta.get('print_mode') or session.layout_id or 'grid_4x6'
+    cut_mode = source_job.cut_mode if source_job else meta.get('cut_mode') or ('2x6' if str(print_mode) == 'double_strip' else 'none')
 
     configured_name = data.get('printer_name') or get_config_value('printer_name', '')
     printer_name, printers = resolve_printer_name(configured_name)
     print_job = PrintJob(
         session_uuid=session_uuid,
-        file_path=source_job.file_path,
+        file_path=source_path,
         printer_name=printer_name or configured_name,
         copies=copies,
-        print_mode=source_job.print_mode,
-        cut_mode=source_job.cut_mode,
+        print_mode=print_mode,
+        cut_mode=cut_mode,
         status='pending'
     )
     db.session.add(print_job)
@@ -975,19 +1186,33 @@ def staff_reprint_session(session_uuid):
         print_job.error_message = 'Printer not found'
         db.session.commit()
         return jsonify({
-            'error': 'Không tìm thấy máy in RX1HS trong Windows.',
+            'error': 'Khong tim thay may in RX1HS trong Windows.',
             'available_printers': printers,
             'job': print_job.to_dict()
         }), 500
 
     try:
-        result = print_image_file(source_job.file_path, printer_name, copies)
+        scale_x = get_int_config('print_scale_x', 100)
+        scale_y = get_int_config('print_scale_y', 100)
+        offset_x = get_int_config('print_offset_x', 0)
+        offset_y = get_int_config('print_offset_y', 0)
+
+        result = print_image_file(
+            source_path, 
+            printer_name, 
+            copies, 
+            cut_mode=cut_mode,
+            scale_x=scale_x,
+            scale_y=scale_y,
+            offset_x=offset_x,
+            offset_y=offset_y
+        )
         print_job.status = 'sent'
         print_job.printer_name = printer_name
         db.session.commit()
         return jsonify({
             'success': True,
-            'message': 'Đã gửi lệnh in lại.',
+            'message': 'Da gui lenh in lai.',
             'job': print_job.to_dict(),
             **result
         }), 200
@@ -997,7 +1222,6 @@ def staff_reprint_session(session_uuid):
         print_job.error_message = str(e)[:500]
         db.session.commit()
         return jsonify({'error': str(e), 'job': print_job.to_dict()}), 500
-
 
 @app.route('/api/staff/sessions/<session_uuid>/print-image', methods=['GET'])
 def staff_session_print_image(session_uuid):
@@ -1265,7 +1489,8 @@ def get_revenue():
             'code': s.payment_method, # Using code field for method/code
             'value': s.amount,
             'used_at': s.created_at.isoformat(),
-            'status': s.status
+            'status': s.status,
+            'device_id': get_device_id()
         } for s in sessions]
     })
 
@@ -1394,10 +1619,13 @@ def init_configs():
         {'key': 'price', 'value': '60000'},
         {'key': 'session_timeout', 'value': '600'}, # 10 minutes
         {'key': 'countdown', 'value': '5'},
+        {'key': 'hotfolder_capture_timeout', 'value': '30'},
+        {'key': 'canon_capture_timeout', 'value': '30'},
         {'key': 'print_price', 'value': '20000'},
         {'key': 'mobile_price', 'value': '30000'},
         {'key': 'mobile_session_timeout', 'value': '300'}, # 5 minutes
         {'key': 'mobile_print_price', 'value': '10000'},
+        {'key': 'price_schedule', 'value': '[]'},
         {'key': 'printer_name', 'value': os.environ.get('PRINTER_NAME', 'RX1HS')},
         {'key': 'printer_copies', 'value': '1'},
         {'key': 'print_brightness', 'value': '0'},
@@ -1406,6 +1634,7 @@ def init_configs():
         {'key': 'print_pink', 'value': '8'},
         {'key': 'print_skin_whitening', 'value': '6'},
         {'key': 'print_warmth', 'value': '2'},
+        {'key': 'print_sharpen', 'value': '70'}, # độ làm nét khi in (0 = tắt)
         {'key': 'camera_mode', 'value': 'webcam'}, # webcam, hotfolder
         {'key': 'hot_folder', 'value': 'C:/Photobooth_Input'},
         {'key': 'trigger_key', 'value': '{F8}'},
@@ -1413,12 +1642,17 @@ def init_configs():
         {'key': 'bill_port', 'value': 'COM3'},
         {'key': 'bill_baudrate', 'value': '9600'},
         {'key': 'bill_enabled', 'value': 'false'},
+        {'key': 'bill_parity', 'value': 'EVEN'},
         {'key': 'bill_mapping', 'value': '{"40": 10000, "41": 20000, "42": 50000, "43": 100000, "44": 200000, "45": 500000}'},
         {'key': 'sepay_bank', 'value': os.environ.get('SEPAY_BANK', '')},
         {'key': 'sepay_account_number', 'value': os.environ.get('SEPAY_ACCOUNT_NUMBER', '')},
         {'key': 'sepay_template', 'value': os.environ.get('SEPAY_TEMPLATE', 'compact')},
         {'key': 'brand_text_primary', 'value': '#7B5E43'},
         {'key': 'brand_text_secondary', 'value': '#5E6B78'},
+        {'key': 'print_scale_x', 'value': '100'},
+        {'key': 'print_scale_y', 'value': '100'},
+        {'key': 'print_offset_x', 'value': '0'},
+        {'key': 'print_offset_y', 'value': '0'},
     ]
     
     for item in defaults:
@@ -1432,12 +1666,82 @@ def init_configs():
         print(f"Config init error: {e}", flush=True)
         db.session.rollback()
 
+@app.route('/api/config/system', methods=['GET'])
+def get_system_config():
+    return jsonify({
+        'device_id': get_device_id()
+    })
+
 @app.route('/api/config', methods=['GET'])
 def get_configs():
+    _apply_due_price_schedule()
     configs = Config.query.all()
     # Convert list to simple dict for easier frontend consumption
     config_dict = {c.key: c.value for c in configs}
     return jsonify(config_dict)
+
+def _parse_schedule_time(value):
+    if not value:
+        return None
+    try:
+        text = str(value).replace('Z', '+00:00')
+        scheduled = datetime.datetime.fromisoformat(text)
+        now = datetime.datetime.now(scheduled.tzinfo) if scheduled.tzinfo else datetime.datetime.now()
+        return scheduled, now
+    except Exception:
+        return None
+
+def _set_config_value(key, value):
+    config = db.session.get(Config, key)
+    if config:
+        config.value = str(value)
+    else:
+        db.session.add(Config(key=key, value=str(value)))
+
+def _apply_due_price_schedule():
+    schedule_config = db.session.get(Config, 'price_schedule')
+    if not schedule_config or not schedule_config.value:
+        return
+    try:
+        schedule = json.loads(schedule_config.value)
+    except Exception:
+        return
+    if not isinstance(schedule, list):
+        return
+
+    changed = False
+    for item in schedule:
+        if not isinstance(item, dict) or item.get('applied'):
+            continue
+        parsed_time = _parse_schedule_time(item.get('run_at'))
+        if not parsed_time:
+            continue
+        scheduled, now = parsed_time
+        if scheduled > now:
+            continue
+
+        for key in ('price', 'print_price', 'mobile_price', 'mobile_print_price'):
+            value = item.get(key)
+            if value not in (None, ''):
+                _set_config_value(key, value)
+        item['applied'] = True
+        item['applied_at'] = datetime.datetime.now(UTC).isoformat()
+        changed = True
+
+    if changed:
+        schedule_config.value = json.dumps(schedule, ensure_ascii=False)
+        db.session.commit()
+
+def get_int_config(key, fallback, min_value=None, max_value=None):
+    try:
+        value = int(get_config_value(key, fallback))
+    except (TypeError, ValueError):
+        value = fallback
+    if min_value is not None:
+        value = max(min_value, value)
+    if max_value is not None:
+        value = min(max_value, value)
+    return value
 
 @app.route('/api/config', methods=['POST'])
 def update_configs():
@@ -1445,11 +1749,7 @@ def update_configs():
     try:
         for key, value in data.items():
             # Only update known keys or allow new ones? Let's allow flexible keys
-            config = db.session.get(Config, key)
-            if config:
-                config.value = str(value)
-            else:
-                db.session.add(Config(key=key, value=str(value)))
+            _set_config_value(key, value)
         
         db.session.commit()
         return jsonify({'message': 'Configuration updated'}), 200
@@ -1484,7 +1784,7 @@ def trigger_capture():
     trigger_key = trigger_key_config.value if trigger_key_config else '{F8}'
     
     import subprocess
-    print(f"📸 Triggering Camera with key: {trigger_key} ...", flush=True)
+    print(f"ðŸ“¸ Triggering Camera with key: {trigger_key} ...", flush=True)
     try:
         # PowerShell command to send keystroke
         # Try to focus EOS Utility first (Best effort), then send key.
@@ -1499,15 +1799,15 @@ def trigger_capture():
         """
         subprocess.run(["powershell", "-c", ps_command], timeout=2)
     except Exception as e:
-        print(f"⚠️ Failed to send trigger key: {e}", flush=True)
+        print(f"âš ï¸ Failed to send trigger key: {e}", flush=True)
     # ------------------------
 
-    print(f" वाचing Hot Folder: {hot_folder_path} ...", flush=True)
+    print(f" à¤µà¤¾à¤šing Hot Folder: {hot_folder_path} ...", flush=True)
     
     # 2. Watch for NEW file
     
     start_time = datetime.datetime.now().timestamp()
-    timeout = 30 # seconds
+    timeout = get_int_config('hotfolder_capture_timeout', 30, min_value=5, max_value=180)
     
     existing_files = set(os.listdir(hot_folder_path))
     
@@ -1683,6 +1983,16 @@ def bill_mapping_api():
         except Exception as e:
             return jsonify({'error': str(e)}), 500
 
+@app.route('/api/bill/accept', methods=['POST'])
+def set_bill_accept():
+    # Bật/tắt nhận tiền mặt. Chỉ bật khi khách chọn tiền mặt ở bước thanh toán.
+    data = request.json or {}
+    accepting = bool(data.get('accepting', False))
+    if not bill_service:
+        return jsonify({'accepting': False, 'error': 'Bill service not initialized'}), 200
+    bill_service.set_accepting(accepting)
+    return jsonify({'accepting': bill_service.accepting}), 200
+
 @app.route('/api/bill/status', methods=['GET'])
 def get_bill_status():
     # If admin asks for specifics, they should use /api/devices/<id>/status
@@ -1742,6 +2052,21 @@ def list_devices():
     devices = Device.query.all() # Assuming we register devices on startup
     return jsonify([d.to_dict() for d in devices])
 
+@app.route('/<path:path>')
+def serve_frontend_app(path):
+    if path.startswith(('api/', 'uploads/', 'socket.io/')):
+        return jsonify({'error': 'Not found'}), 404
+
+    dist_dir = get_frontend_dist_dir()
+    if not dist_dir:
+        return jsonify({'error': 'Frontend dist not found'}), 404
+
+    asset_path = os.path.join(dist_dir, path)
+    if os.path.isfile(asset_path):
+        return send_from_directory(dist_dir, path)
+
+    return send_from_directory(dist_dir, 'index.html')
+
 def register_current_device():
     device_id = get_device_id()
     device = Device.query.filter_by(device_id=device_id).first()
@@ -1783,7 +2108,7 @@ if __name__ == '__main__':
     try:
         with app.app_context():
             db.create_all()
-        socketio.run(app, host='0.0.0.0', port=5000, debug=True, use_reloader=False)
+        socketio.run(app, host='0.0.0.0', port=5000, debug=True, use_reloader=False, allow_unsafe_werkzeug=True)
     except Exception as e:
         logging.error(f"SocketIO Run Error: {e}")
         print(f"SocketIO Run Error: {e}", flush=True)

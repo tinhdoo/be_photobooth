@@ -4,7 +4,7 @@ import time
 import uuid
 from io import BytesIO
 
-from PIL import Image, ImageEnhance, ImageOps
+from PIL import Image, ImageEnhance, ImageOps, ImageFilter
 
 
 PREFERRED_PRINTER_KEYWORDS = ("RX1HS", "DS-RX1", "RX1", "DNP")
@@ -64,6 +64,14 @@ def resolve_printer_name(configured_name=None):
 
 def get_printer_status(configured_name=None):
     printer_name, printers = resolve_printer_name(configured_name)
+
+    # Số giấy còn lại đọc qua Citizen/DNP status SDK (cspstat). None nếu không đọc được.
+    try:
+        from services.printer_media import get_remaining_sheets
+        remaining = get_remaining_sheets()
+    except Exception:
+        remaining = None
+
     status = {
         "online": bool(printer_name),
         "name": printer_name,
@@ -71,8 +79,8 @@ def get_printer_status(configured_name=None):
         "available_printers": printers,
         "status": "Online" if printer_name else "Not found",
         "paper": "4x6",
-        "remaining": None,
-        "remaining_label": "Không đọc được từ driver",
+        "remaining": remaining,
+        "remaining_label": (f"{remaining} tấm" if remaining is not None else "Không đọc được từ driver"),
         "driver": "Unknown",
         "message": "Đã kết nối" if printer_name else "Không tìm thấy máy in",
     }
@@ -108,11 +116,19 @@ def get_printer_status(configured_name=None):
     return status
 
 
-def save_print_image(file_storage, output_dir):
+def save_print_image(file_storage, output_dir, sharpen=70):
     os.makedirs(output_dir, exist_ok=True)
     raw = file_storage.read()
     image = Image.open(BytesIO(raw))
     image = ImageOps.exif_transpose(image).convert("RGB")
+
+    # Làm nét nhẹ để bù độ mềm cố hữu của máy in nhiệt nhuộm (dye-sub). Tắt bằng print_sharpen=0.
+    try:
+        amount = max(0, min(200, int(sharpen)))
+    except Exception:
+        amount = 0
+    if amount > 0:
+        image = image.filter(ImageFilter.UnsharpMask(radius=1.2, percent=amount, threshold=3))
 
     filename = f"print_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}.jpg"
     path = os.path.join(output_dir, filename)
@@ -120,7 +136,96 @@ def save_print_image(file_storage, output_dir):
     return path
 
 
-def print_image_file(image_path, printer_name, copies=1):
+def _rotate_to_match_page(image, page_width, page_height):
+    image_is_landscape = image.width >= image.height
+    page_is_landscape = page_width >= page_height
+    if image_is_landscape != page_is_landscape:
+        return image.rotate(90, expand=True)
+    return image
+
+
+def _print_with_windows_dc(image_path, printer_name, copies, cut_mode="none", scale_x=100, scale_y=100, offset_x=0, offset_y=0):
+    import win32con
+    import win32ui
+    from PIL import ImageWin
+
+    image = Image.open(image_path)
+    image = ImageOps.exif_transpose(image).convert("RGB")
+
+    dc = win32ui.CreateDC()
+    dc.CreatePrinterDC(printer_name)
+    try:
+        printable_width = dc.GetDeviceCaps(win32con.HORZRES)
+        printable_height = dc.GetDeviceCaps(win32con.VERTRES)
+        phys_offset_x = dc.GetDeviceCaps(win32con.PHYSICALOFFSETX)
+        phys_offset_y = dc.GetDeviceCaps(win32con.PHYSICALOFFSETY)
+
+        if printable_width <= 0 or printable_height <= 0:
+            raise RuntimeError("Khong doc duoc kich thuoc vung in tu driver.")
+
+        page_image = _rotate_to_match_page(image, printable_width, printable_height)
+
+        # Parse factors and shift values
+        factor_x = float(scale_x) / 100.0 if scale_x else 1.0
+        factor_y = float(scale_y) / 100.0 if scale_y else 1.0
+        shift_x = int(offset_x) if offset_x else 0
+        shift_y = int(offset_y) if offset_y else 0
+
+        # Calculate logical bounds
+        x1 = -phys_offset_x
+        y1 = -phys_offset_y
+        x2 = printable_width + phys_offset_x
+        y2 = printable_height + phys_offset_y
+
+        width = x2 - x1
+        height = y2 - y1
+
+        # Apply scaling and shifting
+        new_w = width * factor_x
+        new_h = height * factor_y
+        center_x = (x1 + x2) / 2 + shift_x
+        center_y = (y1 + y2) / 2 + shift_y
+
+        # Resize bằng LANCZOS (chất lượng cao) sang ĐÚNG kích thước in, để GDI vẽ 1:1
+        # thay vì tự co giãn bằng thuật toán kém -> tránh ảnh in bị mờ.
+        target_w = max(1, int(round(new_w)))
+        target_h = max(1, int(round(new_h)))
+        render_image = page_image.resize((target_w, target_h), Image.LANCZOS)
+        dib = ImageWin.Dib(render_image)
+
+        left = int(round(center_x - target_w / 2))
+        top = int(round(center_y - target_h / 2))
+        target_box = (left, top, left + target_w, top + target_h)
+
+        for index in range(copies):
+            dc.StartDoc(f"Tomato Photobooth {cut_mode} {index + 1}/{copies}")
+            try:
+                dc.StartPage()
+                # HALFTONE để mọi co giãn còn sót (do làm tròn) vẫn chất lượng cao
+                try:
+                    import win32gui
+                    win32gui.SetStretchBltMode(dc.GetHandleOutput(), win32con.HALFTONE)
+                except Exception:
+                    pass
+                dib.draw(dc.GetHandleOutput(), target_box)
+                dc.EndPage()
+            finally:
+                dc.EndDoc()
+    finally:
+        dc.DeleteDC()
+
+
+def _print_with_mspaint(image_path, printer_name, copies):
+    for _ in range(copies):
+        subprocess.Popen(
+            ["mspaint.exe", "/pt", image_path, printer_name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+
+
+def print_image_file(image_path, printer_name, copies=1, cut_mode="none", scale_x=100, scale_y=100, offset_x=0, offset_y=0):
     if os.name != "nt":
         raise RuntimeError("Chỉ hỗ trợ in trực tiếp trên Windows.")
 
@@ -130,20 +235,25 @@ def print_image_file(image_path, printer_name, copies=1):
     if not os.path.exists(image_path):
         raise FileNotFoundError(image_path)
 
-    # mspaint /pt delegates final media/cut/color settings to the installed printer driver.
-    # This is the most dependency-light path; pywin32 is not required on kiosk machines.
-    for _ in range(copies):
-        subprocess.Popen(
-            ["mspaint.exe", "/pt", image_path, printer_name],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
+    method = "windows_dc"
+    try:
+        _print_with_windows_dc(image_path, printer_name, copies, cut_mode, scale_x, scale_y, offset_x, offset_y)
+    except Exception as direct_error:
+        method = "mspaint_fallback"
+        print(f"Direct Windows print failed, falling back to mspaint: {direct_error}")
+        _print_with_mspaint(image_path, printer_name, copies)
+
+    cut_note = None
+    if str(cut_mode).lower() in {"2x6", "2-inch", "2inch"}:
+        cut_note = "DNP 2x6 cut must be enabled in the printer driver's Printing Defaults."
 
     return {
         "printer": printer_name,
         "copies": copies,
+        "cut_mode": cut_mode,
+        "cut_note": cut_note,
         "file_path": image_path,
+        "method": method,
     }
 
 
