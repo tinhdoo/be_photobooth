@@ -2086,6 +2086,37 @@ def register_current_device():
     print(f"Registered Device: {device_id}", flush=True)
 
 
+def push_booth_report_to_cloud():
+    """Gửi báo cáo cuối ngày (giấy còn + tiền mặt HÔM QUA) lên cloud — gọi 1 lần lúc bật máy."""
+    try:
+        import requests
+        cloud_url = (os.environ.get('CLOUD_API_URL') or 'https://tomatophotobooth.vercel.app').rstrip('/')
+        device_id = get_device_id()
+        try:
+            from services.printer_media import get_remaining_sheets
+            paper = get_remaining_sheets()
+        except Exception:
+            paper = None
+        # Tiền mặt của NGÀY HÔM QUA (ngày vừa hoàn tất)
+        yesterday = (datetime.datetime.now() - datetime.timedelta(days=1)).strftime('%Y-%m-%d')
+        with app.app_context():
+            entries = BillCashEntry.query.filter_by(device_id=device_id, business_date=yesterday).all()
+            cash_total = sum(int(e.amount or 0) for e in entries)
+            cash_count = len(entries)
+        payload = {
+            'action': 'report',
+            'device_id': device_id,
+            'paper_remaining': paper,
+            'cash_total': cash_total,
+            'cash_count': cash_count,
+            'business_date': yesterday,
+        }
+        requests.post(f"{cloud_url}/api/devices", json=payload, timeout=15)
+        print(f"[BoothReport] Đã gửi: giấy={paper}, tiền mặt {yesterday}={cash_total} ({cash_count} lần)", flush=True)
+    except Exception as e:
+        print(f"[BoothReport] Gửi báo cáo thất bại: {e}", flush=True)
+
+
 # Startup Init
 with app.app_context():
     print("APP: Creating DB...", flush=True)
@@ -2103,6 +2134,11 @@ with app.app_context():
         logging.exception("Bill service initialization failed")
         print(f"Bill service initialization failed: {e}", flush=True)
     print("APP: Startup routines done", flush=True)
+
+# Gửi báo cáo giấy + tiền mặt lên cloud 1 lần lúc bật máy (chạy nền, không chặn khởi động)
+import threading as _threading
+import time as _time
+_threading.Thread(target=lambda: (_time.sleep(8), push_booth_report_to_cloud()), daemon=True).start()
 
 
 from routes.convert_motion import convert_motion_bp
