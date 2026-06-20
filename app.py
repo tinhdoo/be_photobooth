@@ -1131,7 +1131,14 @@ def _session_staff_dict(session):
 @app.route('/api/staff/sessions/recent', methods=['GET'])
 def staff_recent_sessions():
     limit = min(max(int(request.args.get('limit', 30) or 30), 1), 100)
-    sessions = Session.query.order_by(Session.created_at.desc()).limit(limit).all()
+    # Chỉ lấy phiên TRONG NGÀY hôm nay (theo giờ local). created_at lưu UTC nên quy
+    # nửa đêm local -> UTC để so sánh. Qua nửa đêm là tự reset (phiên hôm trước ẩn đi).
+    local_midnight = datetime.datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+    start_utc = local_midnight.astimezone(UTC).replace(tzinfo=None)
+    sessions = (Session.query
+                .filter(Session.created_at >= start_utc)
+                .order_by(Session.created_at.desc())
+                .limit(limit).all())
     return jsonify([_session_staff_dict(session) for session in sessions])
 
 
