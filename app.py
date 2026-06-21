@@ -1,3 +1,10 @@
+# PHẢI là thứ chạy đầu tiên tuyệt đối. Khi đóng gói PyInstaller, multiprocessing dùng
+# 'spawn' trên Windows -> tiến trình con chạy lại chính exe từ đầu. Không có freeze_support()
+# thì con sẽ re-exec toàn bộ phần khởi động (mở COM1, load model...) và không bao giờ tới
+# socketio.run -> port 5000 không mở, app kẹt trong vòng lặp tự khởi động lại.
+import multiprocessing
+multiprocessing.freeze_support()
+
 import eventlet
 eventlet.monkey_patch()
 
@@ -1065,6 +1072,19 @@ def _latest_print_job(session_uuid):
     return PrintJob.query.filter_by(session_uuid=session_uuid).order_by(PrintJob.created_at.desc()).first()
 
 
+def _resolve_print_source_job(identifier):
+    """Tìm PrintJob local có file in theo session_uuid (trường hợp thường), nếu không có
+    thì thử theo chính uuid của PrintJob (job lẻ không gắn session_uuid)."""
+    job = (PrintJob.query
+           .filter(PrintJob.session_uuid == identifier, PrintJob.file_path.isnot(None))
+           .order_by(PrintJob.created_at.desc()).first())
+    if not job:
+        job = (PrintJob.query
+               .filter(PrintJob.uuid == identifier, PrintJob.file_path.isnot(None))
+               .order_by(PrintJob.created_at.desc()).first())
+    return job
+
+
 def _local_upload_path_from_url(url):
     if not url:
         return None
@@ -1137,18 +1157,58 @@ def _session_staff_dict(session):
     }
 
 
+def _printjob_staff_dict(latest, file_job=None):
+    """latest = job mới nhất của phiên (lấy trạng thái/thông số). file_job = job mới nhất
+    CÓ file in của phiên đó (để in lại / preview); có thể khác latest nếu lần in cuối lỗi."""
+    has_file = file_job is not None
+    key = latest.session_uuid or latest.uuid  # khóa dùng cho in lại / xem preview
+    created = latest.created_at or datetime.datetime.now(UTC)
+    return {
+        'id': latest.id,
+        'uuid': key,
+        'sessionId': f"S{created.strftime('%y%m%d')}-{latest.id:03d}",
+        'layout': latest.print_mode,
+        'amount': 0,
+        'paymentMethod': None,
+        'paymentStatus': 'unknown',
+        'printStatus': latest.status or 'not_printed',
+        'printError': latest.error_message,
+        'copies': (file_job or latest).copies or 1,
+        'printMode': (file_job or latest).print_mode,
+        'cutMode': (file_job or latest).cut_mode,
+        'finalImageUrl': None,
+        'finalImagePath': file_job.file_path if file_job else None,
+        'previewUrl': f"/api/staff/sessions/{key}/print-image" if has_file else None,
+        'canReprint': has_file,
+        'createdAt': created.isoformat(),
+    }
+
+
 @app.route('/api/staff/sessions/recent', methods=['GET'])
 def staff_recent_sessions():
     limit = min(max(int(request.args.get('limit', 30) or 30), 1), 100)
-    # Chỉ lấy phiên TRONG NGÀY hôm nay (theo giờ local). created_at lưu UTC nên quy
-    # nửa đêm local -> UTC để so sánh. Qua nửa đêm là tự reset (phiên hôm trước ẩn đi).
+    # In lại / In thêm chạy trên máy booth: phiên chụp được lưu lên CLOUD nên DB local
+    # KHÔNG có Session. Mỗi lần in tạo 1 PrintJob LOCAL kèm file in + thông số, nên phải
+    # đọc lịch sử in từ PrintJob mới đúng nguồn (trước đây query Session -> luôn rỗng).
+    # Chỉ lấy job TRONG NGÀY hôm nay (giờ local). created_at lưu UTC -> quy nửa đêm local sang UTC.
     local_midnight = datetime.datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
     start_utc = local_midnight.astimezone(UTC).replace(tzinfo=None)
-    sessions = (Session.query
-                .filter(Session.created_at >= start_utc)
-                .order_by(Session.created_at.desc())
-                .limit(limit).all())
-    return jsonify([_session_staff_dict(session) for session in sessions])
+    jobs = (PrintJob.query
+            .filter(PrintJob.created_at >= start_utc)
+            .order_by(PrintJob.created_at.desc())
+            .all())
+    # Gộp theo phiên: giữ job mới nhất (trạng thái) + job mới nhất có file (để in lại).
+    order = []
+    agg = {}
+    for job in jobs:
+        key = job.session_uuid or job.uuid
+        if key not in agg:
+            agg[key] = {'latest': job, 'file_job': None}
+            order.append(key)
+        if agg[key]['file_job'] is None and job.file_path and os.path.exists(job.file_path):
+            agg[key]['file_job'] = job
+    items = [_printjob_staff_dict(agg[k]['latest'], agg[k]['file_job']) for k in order[:limit]]
+    return jsonify(items)
 
 
 @app.route('/api/staff/sessions/<session_uuid>/reprint', methods=['POST'])
@@ -1159,17 +1219,14 @@ def staff_reprint_session(session_uuid):
     except (TypeError, ValueError):
         copies = 1
 
+    # Phiên thường KHÔNG có ở DB local (chỉ lưu trên cloud) -> in lại dựa vào PrintJob local.
     session = Session.query.filter_by(uuid=session_uuid).first()
-    if not session:
-        return jsonify({'error': 'Khong tim thay phien chup.'}), 404
 
-    source_job = PrintJob.query.filter(
-        PrintJob.session_uuid == session_uuid,
-        PrintJob.file_path.isnot(None)
-    ).order_by(PrintJob.created_at.desc()).first()
+    source_job = _resolve_print_source_job(session_uuid)
 
     source_path = source_job.file_path if source_job and source_job.file_path and os.path.exists(source_job.file_path) else None
-    if not source_path:
+    if not source_path and session:
+        # Không còn file in local nhưng có Session cloud -> tải lại ảnh ghép để dựng file in.
         try:
             source_path = _materialize_session_print_file(session)
         except Exception as e:
@@ -1179,9 +1236,9 @@ def staff_reprint_session(session_uuid):
     if not source_path or not os.path.exists(source_path):
         return jsonify({'error': 'Khong tim thay file in cua phien nay.'}), 404
 
-    meta = session.meta_data or {}
-    print_mode = source_job.print_mode if source_job else meta.get('print_mode') or session.layout_id or 'grid_4x6'
-    cut_mode = source_job.cut_mode if source_job else meta.get('cut_mode') or ('2x6' if str(print_mode) == 'double_strip' else 'none')
+    meta = (session.meta_data or {}) if session else {}
+    print_mode = source_job.print_mode if source_job else (meta.get('print_mode') or (session.layout_id if session else None) or 'grid_4x6')
+    cut_mode = source_job.cut_mode if source_job else (meta.get('cut_mode') or ('2x6' if str(print_mode) == 'double_strip' else 'none'))
 
     configured_name = data.get('printer_name') or get_config_value('printer_name', '')
     printer_name, printers = resolve_printer_name(configured_name)
@@ -1241,10 +1298,7 @@ def staff_reprint_session(session_uuid):
 
 @app.route('/api/staff/sessions/<session_uuid>/print-image', methods=['GET'])
 def staff_session_print_image(session_uuid):
-    source_job = PrintJob.query.filter(
-        PrintJob.session_uuid == session_uuid,
-        PrintJob.file_path.isnot(None)
-    ).order_by(PrintJob.created_at.desc()).first()
+    source_job = _resolve_print_source_job(session_uuid)
 
     if not source_job or not source_job.file_path:
         return jsonify({'error': 'Không tìm thấy file in local của phiên này.'}), 404
@@ -1321,8 +1375,12 @@ def validate_code():
     if code.is_used:
         return jsonify({'valid': False, 'message': 'Code already used'}), 400
         
-    if code.expires_at and code.expires_at < datetime.datetime.now():
-        return jsonify({'valid': False, 'message': 'Code expired'}), 400
+    if code.expires_at:
+        # expires_at lưu theo UTC (naive). So sánh với "now" UTC naive để tránh lệch 7h
+        # (trước đây dùng datetime.now() local -> mã hết hạn sớm/muộn 7 tiếng).
+        exp = code.expires_at.replace(tzinfo=None) if code.expires_at.tzinfo else code.expires_at
+        if exp < datetime.datetime.now(UTC).replace(tzinfo=None):
+            return jsonify({'valid': False, 'message': 'Code expired'}), 400
         
     return jsonify({'valid': True, 'value': code.value, 'id': code.id}), 200
 
@@ -1391,34 +1449,53 @@ def get_sepay_order_status(code):
     if not order:
         return jsonify({'error': 'Order not found'}), 404
 
-    if order.status == 'pending' and order.expires_at and order.expires_at < datetime.datetime.now(UTC):
-        order.status = 'expired'
-        db.session.commit()
+    if order.status == 'pending' and order.expires_at:
+        # expires_at là naive UTC -> so với now UTC naive (tránh TypeError offset-naive vs aware).
+        exp = order.expires_at.replace(tzinfo=None) if order.expires_at.tzinfo else order.expires_at
+        if exp < datetime.datetime.now(UTC).replace(tzinfo=None):
+            order.status = 'expired'
+            db.session.commit()
 
     return jsonify(order.to_dict()), 200
 
 @app.route('/webhook/sepay', methods=['POST'])
 def sepay_webhook():
+    import re
     expected_key = os.environ.get('SEPAY_API_KEY')
-    if expected_key:
-        expected_auth = f"Apikey {expected_key}"
-        auth_header = request.headers.get('Authorization', '')
-        if not hmac.compare_digest(auth_header, expected_auth):
-            return jsonify({'success': False, 'message': 'Unauthorized'}), 401
+    # Fail-closed: chưa cấu hình key -> TỪ CHỐI, tránh bất kỳ ai cũng POST giả "đã thanh toán".
+    if not expected_key:
+        return jsonify({'success': False, 'message': 'Webhook not configured'}), 503
+    expected_auth = f"Apikey {expected_key}"
+    auth_header = request.headers.get('Authorization', '')
+    if not hmac.compare_digest(auth_header, expected_auth):
+        return jsonify({'success': False, 'message': 'Unauthorized'}), 401
 
     payload = request.get_json(silent=True) or {}
     content = str(payload.get('content') or '')
     webhook_code = str(payload.get('code') or '')
     transfer_type = str(payload.get('transferType') or '').lower()
     transfer_amount = int(payload.get('transferAmount') or 0)
+    tx_ref = payload.get('referenceCode') or str(payload.get('id') or '')
 
     if transfer_type and transfer_type != 'in':
         return jsonify({'success': True, 'message': 'Ignored non-incoming transfer'}), 200
 
+    # Idempotency: SePay có thể retry webhook trùng -> nếu transaction này đã xử lý thì bỏ qua.
+    if tx_ref:
+        already = PaymentOrder.query.filter_by(transaction_reference=tx_ref).first()
+        if already:
+            return jsonify({'success': True, 'message': 'Already processed'}), 200
+
+    def _code_in_content(code, text):
+        # Khớp code như một token độc lập (không phải substring) để tránh khớp nhầm đơn khác.
+        return bool(code) and re.search(r'(?<![A-Za-z0-9])' + re.escape(code) + r'(?![A-Za-z0-9])', text) is not None
+
     order = None
     candidates = PaymentOrder.query.filter_by(status='pending').order_by(PaymentOrder.created_at.desc()).limit(50).all()
     for candidate in candidates:
-        if candidate.code == webhook_code or candidate.code in content:
+        # Khớp CHÍNH XÁC theo field code; chỉ dò trong content (theo ranh giới token) khi
+        # webhook không có field code. Bỏ hẳn kiểu `code in content` (substring) gây khớp nhầm.
+        if (webhook_code and candidate.code == webhook_code) or (not webhook_code and _code_in_content(candidate.code, content)):
             order = candidate
             break
 
@@ -1432,7 +1509,7 @@ def sepay_webhook():
 
     order.status = 'paid'
     order.paid_at = datetime.datetime.now(UTC)
-    order.transaction_reference = payload.get('referenceCode') or str(payload.get('id') or '')
+    order.transaction_reference = tx_ref
     order.raw_payload = payload
     db.session.commit()
 
@@ -2137,11 +2214,18 @@ with app.app_context():
     init_configs()
     print("APP: Initializing Bill Service...", flush=True)
     register_current_device()
-    try:
-        init_bill_service()
-    except Exception as e:
-        logging.exception("Bill service initialization failed")
-        print(f"Bill service initialization failed: {e}", flush=True)
+    # Chỉ mở COM (bill service) ở TIẾN TRÌNH CHÍNH. Khi đóng gói PyInstaller + multiprocessing
+    # spawn, tiến trình con re-import module -> nếu mở COM ở con sẽ chiếm cổng, tiến trình chính
+    # mở lại báo "Access is denied". (freeze_support đã chặn phần lớn; đây là guard phòng xa.)
+    import multiprocessing as _mp
+    if _mp.current_process().name == 'MainProcess':
+        try:
+            init_bill_service()
+        except Exception as e:
+            logging.exception("Bill service initialization failed")
+            print(f"Bill service initialization failed: {e}", flush=True)
+    else:
+        print("APP: Skip bill service init (not MainProcess)", flush=True)
     print("APP: Startup routines done", flush=True)
 
 # Gửi báo cáo giấy + tiền mặt lên cloud 1 lần lúc bật máy (chạy nền, không chặn khởi động)
@@ -2160,7 +2244,7 @@ if __name__ == '__main__':
     try:
         with app.app_context():
             db.create_all()
-        socketio.run(app, host='0.0.0.0', port=5000, debug=True, use_reloader=False, allow_unsafe_werkzeug=True)
+        socketio.run(app, host='0.0.0.0', port=5000, debug=False, use_reloader=False, allow_unsafe_werkzeug=True)
     except Exception as e:
         logging.error(f"SocketIO Run Error: {e}")
         print(f"SocketIO Run Error: {e}", flush=True)

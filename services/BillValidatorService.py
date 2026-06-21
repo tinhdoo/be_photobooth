@@ -103,6 +103,13 @@ class BillValidatorService:
 
     def stop(self):
         self.running = False
+        # Chờ thread đọc serial THỰC SỰ dừng trước khi đóng/mở lại cổng. Nếu không, reload_config
+        # gọi stop() rồi start() ngay -> thread cũ còn sống vẫn giữ COM port -> thread mới mở lại
+        # cùng port báo "Access is denied" / mở COM hai lần.
+        t = self.thread
+        if t and t.is_alive() and t is not threading.current_thread():
+            t.join(timeout=3)
+        self.thread = None
         if self.serial_conn:
             try:
                 self.serial_conn.close()
@@ -176,6 +183,11 @@ class BillValidatorService:
                         retry_count += 1
                         time.sleep(2)
                         continue
+
+                # Nghỉ 1 nhịp nhỏ mỗi vòng: nhường CPU (tránh busy-loop 100% CPU) và yield
+                # cho eventlet. Nếu thiếu, green thread này chiếm trọn event loop -> socketio.run
+                # không chạy được -> port 5000 không mở, cả backend treo.
+                time.sleep(0.02)
 
                 # Read byte
                 if self.serial_conn.in_waiting > 0:

@@ -16,6 +16,12 @@ _dll_tried = False
 _cache = {"ts": 0.0, "value": None}
 _CACHE_TTL = 8.0  # giây
 
+# TẠM TẮT GetMediaCounter: trên máy DNP RX1 (DS-RX1-Cut), hàm này gây ACCESS VIOLATION
+# (chữ ký SDK chưa đúng) -> làm bất ổn tiến trình, hỏng luôn luồng in. Để False cho an
+# toàn (số giấy còn lại trả None) tới khi có tài liệu/SDK đúng của cspstat/DNP.
+_MEDIA_COUNTER_ENABLED = False
+_disabled_warned = False
+
 
 def _find_dll_path():
     name = "cspstat64.dll"
@@ -69,6 +75,16 @@ def _is_valid(value):
 
 def get_remaining_sheets():
     """Trả về số giấy còn lại (int) hoặc None nếu không đọc được."""
+    global _disabled_warned
+    # An toàn trên hết: không gọi GetMediaCounter khi đang tắt (tránh access violation
+    # làm hỏng tiến trình/luồng in). Trả None gọn gàng.
+    if not _MEDIA_COUNTER_ENABLED:
+        if not _disabled_warned:
+            print("[PrinterMedia] GetMediaCounter dang TAT (tranh access violation tren DNP). "
+                  "So giay con lai = None.", flush=True)
+            _disabled_warned = True
+        return None
+
     now = time.time()
     if now - _cache["ts"] < _CACHE_TTL:
         return _cache["value"]
@@ -79,11 +95,28 @@ def get_remaining_sheets():
         try:
             buf = ctypes.create_string_buffer(64)
             count = dll.GetPrinterPortNum(buf, 64)
+            # Log chẩn đoán: cho biết SDK thấy bao nhiêu máy in + vài byte cổng đầu tiên.
+            first_bytes = list(buf.raw[:8])
+            print(f"[PrinterMedia] GetPrinterPortNum -> count={count}, port_bytes={first_bytes}", flush=True)
             if count and count >= 1:
-                port = buf.raw[0]  # cổng máy in đầu tiên (booth 1 máy -> thường = 0)
-                remaining = dll.GetMediaCounter(port)
-                if _is_valid(remaining):
-                    value = int(remaining)
+                b = buf.raw
+                # Số cổng có thể là 1 byte, 2 byte hoặc 4 byte little-endian. Log thực tế cho
+                # port_bytes=[5,1,...] -> nhiều khả năng cổng = 0x0105 = 261 chứ không phải 5
+                # (code cũ chỉ đọc 1 byte đầu nên GetMediaCounter trả -1). Thử lần lượt, lấy
+                # giá trị hợp lệ đầu tiên.
+                candidates = []
+                for p in (b[0], b[0] | (b[1] << 8), int.from_bytes(b[0:4], 'little')):
+                    if p not in candidates:
+                        candidates.append(p)
+                for port in candidates:
+                    remaining = dll.GetMediaCounter(port)
+                    print(f"[PrinterMedia] GetMediaCounter(port={port}) -> {remaining} (valid={_is_valid(remaining)})", flush=True)
+                    if _is_valid(remaining):
+                        value = int(remaining)
+                        break
+            else:
+                print("[PrinterMedia] SDK khong thay may in Citizen/DNP nao (count<1). "
+                      "Kiem tra: may in dung model Citizen? Da bat? Driver dung?", flush=True)
         except Exception as e:
             print(f"[PrinterMedia] Loi doc media counter: {e}", flush=True)
             value = None

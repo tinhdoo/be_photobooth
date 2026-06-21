@@ -171,7 +171,21 @@ def _print_with_windows_dc(image_path, printer_name, copies, cut_mode="none", sc
         shift_x = int(offset_x) if offset_x else 0
         shift_y = int(offset_y) if offset_y else 0
 
-        # Calculate logical bounds
+        # Log thông số máy in để biết vì sao bị cắt / có viền: nếu phys_offset > 0 nghĩa là
+        # driver báo có lề KHÔNG in được -> full-bleed sẽ cắt đúng phần đó. DNP borderless
+        # đúng chuẩn phải cho phys_offset = 0 (in tràn lề, không cắt, không viền).
+        try:
+            phys_w = dc.GetDeviceCaps(win32con.PHYSICALWIDTH)
+            phys_h = dc.GetDeviceCaps(win32con.PHYSICALHEIGHT)
+        except Exception:
+            phys_w = phys_h = 0
+        print(f"[Print] DeviceCaps {printer_name}: printable={printable_width}x{printable_height}, "
+              f"physical={phys_w}x{phys_h}, phys_offset=({phys_offset_x},{phys_offset_y}), "
+              f"image={image.width}x{image.height}", flush=True)
+
+        # Full-bleed: vẽ phủ kín toàn trang vật lý (không viền trắng theo yêu cầu).
+        # Phần lọt vào lề không in được (phys_offset) sẽ bị máy in cắt - chỉ thực sự hết cắt
+        # khi phys_offset = 0 (driver để borderless đúng).
         x1 = -phys_offset_x
         y1 = -phys_offset_y
         x2 = printable_width + phys_offset_x
@@ -215,16 +229,6 @@ def _print_with_windows_dc(image_path, printer_name, copies, cut_mode="none", sc
         dc.DeleteDC()
 
 
-def _print_with_mspaint(image_path, printer_name, copies):
-    for _ in range(copies):
-        subprocess.Popen(
-            ["mspaint.exe", "/pt", image_path, printer_name],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
-
-
 def print_image_file(image_path, printer_name, copies=1, cut_mode="none", scale_x=100, scale_y=100, offset_x=0, offset_y=0):
     if os.name != "nt":
         raise RuntimeError("Chỉ hỗ trợ in trực tiếp trên Windows.")
@@ -236,12 +240,11 @@ def print_image_file(image_path, printer_name, copies=1, cut_mode="none", scale_
         raise FileNotFoundError(image_path)
 
     method = "windows_dc"
-    try:
-        _print_with_windows_dc(image_path, printer_name, copies, cut_mode, scale_x, scale_y, offset_x, offset_y)
-    except Exception as direct_error:
-        method = "mspaint_fallback"
-        print(f"Direct Windows print failed, falling back to mspaint: {direct_error}")
-        _print_with_mspaint(image_path, printer_name, copies)
+    # KHÔNG fallback sang mspaint: mspaint in "fit to page" -> letterbox VIỀN TRẮNG (khác
+    # full-bleed), dùng Popen không chờ/không bắt lỗi (luôn coi như thành công), và nếu
+    # windows_dc đã spool được vài bản rồi mới lỗi thì mspaint in lại đủ copies -> IN TRÙNG.
+    # Thà để lỗi ném ra ngoài để endpoint đánh dấu PrintJob 'failed' và in lại có kiểm soát.
+    _print_with_windows_dc(image_path, printer_name, copies, cut_mode, scale_x, scale_y, offset_x, offset_y)
 
     cut_note = None
     if str(cut_mode).lower() in {"2x6", "2-inch", "2inch"}:
