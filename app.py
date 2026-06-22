@@ -1762,7 +1762,7 @@ def init_configs():
         {'key': 'camera_mode', 'value': 'webcam'}, # webcam, hotfolder
         {'key': 'hot_folder', 'value': 'C:/Photobooth_Input'},
         {'key': 'trigger_key', 'value': '{F8}'},
-        {'key': 'staff_pin', 'value': os.environ.get('STAFF_PIN', '1310')},
+        {'key': 'staff_pin', 'value': os.environ.get('STAFF_PIN', '8888')},
         {'key': 'bill_port', 'value': 'COM3'},
         {'key': 'bill_baudrate', 'value': '9600'},
         {'key': 'bill_enabled', 'value': 'false'},
@@ -1782,7 +1782,13 @@ def init_configs():
     for item in defaults:
         if not db.session.get(Config, item['key']):
             db.session.add(Config(key=item['key'], value=item['value']))
-    
+
+    # Đổi PIN staff mặc định CŨ 1310 -> 8888 (chạy 1 lần trên booth còn giá trị cũ).
+    # Nếu admin đã đặt PIN khác thì giữ nguyên.
+    _pin = db.session.get(Config, 'staff_pin')
+    if _pin and _pin.value == '1310':
+        _pin.value = '8888'
+
     try:
         db.session.commit()
         print("Config initialized.", flush=True)
