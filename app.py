@@ -1819,6 +1819,10 @@ def _apply_due_price_schedule():
     for item in schedule:
         if not isinstance(item, dict) or item.get('applied'):
             continue
+        # Item lặp hằng ngày KHÔNG "tiêu thụ" ở backend (không đánh dấu applied). Giá hiệu lực
+        # cho item daily được tính live phía FE (getCurrentPricing) theo mốc giờ gần nhất.
+        if item.get('repeat') == 'daily':
+            continue
         parsed_time = _parse_schedule_time(item.get('run_at'))
         if not parsed_time:
             continue
