@@ -888,11 +888,24 @@ def get_camera_status():
         }
 
     if mode == 'canon':
+        # Web server cổng 5001 của middleware CHỈ chạy khi ConnectCamera() thành công lúc khởi
+        # động -> cổng 5001 phản hồi được nghĩa là camera Canon đã kết nối. Kiểm tra nhanh bằng
+        # TCP (eventlet đã patch socket nên không treo); KHÔNG gọi /capture hay /liveview để
+        # tránh chụp / bật live view ngoài ý muốn.
+        import socket as _socket
+        connected = False
+        try:
+            _s = _socket.create_connection(('127.0.0.1', 5001), timeout=1.5)
+            _s.close()
+            connected = True
+        except Exception:
+            connected = False
         return {
-            "online": None,
+            "online": connected,
             "mode": mode,
             "name": "Canon middleware",
-            "message": "Cần kiểm tra qua middleware Canon trên máy local",
+            "message": "Đã kết nối (middleware Canon, cổng 5001)" if connected
+                       else "Không thấy middleware Canon ở cổng 5001 — kiểm tra middleware đã chạy chưa",
             "browser_check_required": False,
         }
 
