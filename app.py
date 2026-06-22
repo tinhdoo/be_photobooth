@@ -942,6 +942,23 @@ def hardware_status():
     }), 200
 
 
+@app.route('/api/kiosk/exit', methods=['POST'])
+def kiosk_exit():
+    # Thoát kiosk: đóng trình duyệt kiosk (Chrome/Edge) để staff về màn hình Windows.
+    # Backend vẫn chạy nền; mở lại kiosk bằng START_PHOTOBOOTH. Chỉ chạy trên Windows.
+    if os.name != 'nt':
+        return jsonify({'error': 'Chỉ hỗ trợ trên Windows'}), 400
+    import subprocess
+    closed = []
+    for exe in ('chrome.exe', 'msedge.exe'):
+        try:
+            subprocess.run(['taskkill', '/F', '/IM', exe], creationflags=subprocess.CREATE_NO_WINDOW, capture_output=True, timeout=5)
+            closed.append(exe)
+        except Exception as e:
+            print(f"[Kiosk] taskkill {exe} loi: {e}", flush=True)
+    return jsonify({'success': True, 'closed': closed}), 200
+
+
 @app.route('/api/printer/test', methods=['POST'])
 def test_printer():
     payload = request.json if request.is_json and request.json else {}
@@ -1033,7 +1050,8 @@ def print_photo():
 
     try:
         print_folder = os.path.join(os.getcwd(), 'uploads', 'print_jobs')
-        saved_path = save_print_image(file, print_folder, sharpen=get_int_config('print_sharpen', 70))
+        # Bỏ làm nét (UnsharpMask) -> in giữ nguyên chất lượng/độ nét ảnh gốc.
+        saved_path = save_print_image(file, print_folder, sharpen=0)
         print_job.file_path = saved_path
         print_job.printer_name = printer_name
         db.session.commit()
