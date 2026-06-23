@@ -9,6 +9,74 @@ from PIL import Image, ImageEnhance, ImageOps, ImageFilter
 
 PREFERRED_PRINTER_KEYWORDS = ("RX1HS", "DS-RX1", "RX1", "DNP")
 
+# Tên file blob DEVMODE đã "chụp" sẵn từ UI driver (xem tools/capture_dnp_devmode.py).
+# Dùng để điều khiển dao cắt DNP theo từng lệnh in thay vì phụ thuộc Printing Defaults.
+CUT_DEVMODE_FILE = "devmode_cut.bin"
+NOCUT_DEVMODE_FILE = "devmode_nocut.bin"
+
+# Các giá trị cut_mode được hiểu là "cắt đôi 4x6 -> 2 strip 2x6".
+_CUT_MODE_VALUES = {"2x6", "2-inch", "2inch", "cut"}
+
+
+def devmode_profile_dir():
+    """Thư mục chứa các blob DEVMODE đã chụp (cạnh thư mục làm việc của backend)."""
+    return os.path.join(os.getcwd(), "printer_profiles")
+
+
+def _is_cut_mode(cut_mode):
+    return str(cut_mode or "").strip().lower() in _CUT_MODE_VALUES
+
+
+def _resolve_cut_devmode(cut_mode):
+    """
+    Nạp blob DEVMODE phù hợp với cut_mode:
+      - cut_mode cắt đôi  -> devmode_cut.bin
+      - còn lại           -> devmode_nocut.bin
+    Trả về bytes nếu file tồn tại & đọc được, ngược lại None (sẽ fallback DC mặc định).
+    """
+    filename = CUT_DEVMODE_FILE if _is_cut_mode(cut_mode) else NOCUT_DEVMODE_FILE
+    path = os.path.join(devmode_profile_dir(), filename)
+    try:
+        if os.path.exists(path):
+            with open(path, "rb") as fh:
+                data = fh.read()
+            return data or None
+    except Exception:
+        pass
+    return None
+
+
+def _create_printer_dc(printer_name, cut_mode, win32ui):
+    """
+    Tạo DC máy in. Nếu có blob DEVMODE phù hợp với cut_mode -> dùng nó để điều khiển
+    dao cắt DNP theo từng lệnh in. Nếu chưa cấu hình blob -> dùng DC mặc định của driver
+    (hành vi cũ) và ghi log cảnh báo.
+    """
+    devmode = _resolve_cut_devmode(cut_mode)
+    if devmode:
+        try:
+            from services import printer_devmode
+
+            hdc = printer_devmode.create_dc_handle(printer_name, devmode)
+            dc = win32ui.CreateDCFromHandle(hdc)
+            print(f"[Print] Dung DEVMODE tuy chinh cho cut_mode={cut_mode} "
+                  f"({'CUT' if _is_cut_mode(cut_mode) else 'NO-CUT'}, {len(devmode)} bytes)",
+                  flush=True)
+            return dc
+        except Exception as exc:
+            print(f"[Print] Khong dung duoc DEVMODE tuy chinh ({exc}); quay ve DC mac dinh.",
+                  flush=True)
+    elif _is_cut_mode(cut_mode):
+        print("[Print] CANH BAO: thieu devmode_cut.bin -> dao cat phu thuoc Printing Defaults "
+              "cua driver. Chay tools/capture_dnp_devmode.py de cau hinh cat per-job.", flush=True)
+    else:
+        print("[Print] CANH BAO: thieu devmode_nocut.bin -> neu driver dang bat 2inch cut thi "
+              "anh van bi cat doi. Chay tools/capture_dnp_devmode.py de cau hinh.", flush=True)
+
+    dc = win32ui.CreateDC()
+    dc.CreatePrinterDC(printer_name)
+    return dc
+
 
 def _get_printers_powershell():
     try:
@@ -152,8 +220,8 @@ def _print_with_windows_dc(image_path, printer_name, copies, cut_mode="none", sc
     image = Image.open(image_path)
     image = ImageOps.exif_transpose(image).convert("RGB")
 
-    dc = win32ui.CreateDC()
-    dc.CreatePrinterDC(printer_name)
+    # Tạo DC: ưu tiên blob DEVMODE đã chụp để điều khiển dao cắt theo từng lệnh in.
+    dc = _create_printer_dc(printer_name, cut_mode, win32ui)
     try:
         printable_width = dc.GetDeviceCaps(win32con.HORZRES)
         printable_height = dc.GetDeviceCaps(win32con.VERTRES)
@@ -247,8 +315,10 @@ def print_image_file(image_path, printer_name, copies=1, cut_mode="none", scale_
     _print_with_windows_dc(image_path, printer_name, copies, cut_mode, scale_x, scale_y, offset_x, offset_y)
 
     cut_note = None
-    if str(cut_mode).lower() in {"2x6", "2-inch", "2inch"}:
-        cut_note = "DNP 2x6 cut must be enabled in the printer driver's Printing Defaults."
+    if _is_cut_mode(cut_mode):
+        if _resolve_cut_devmode(cut_mode) is None:
+            cut_note = ("Chưa có devmode_cut.bin -> dao cắt đang phụ thuộc Printing Defaults của "
+                        "driver. Chạy tools/capture_dnp_devmode.py để điều khiển cắt per-job.")
 
     return {
         "printer": printer_name,

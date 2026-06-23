@@ -1269,7 +1269,7 @@ def staff_reprint_session(session_uuid):
 
     meta = (session.meta_data or {}) if session else {}
     print_mode = source_job.print_mode if source_job else (meta.get('print_mode') or (session.layout_id if session else None) or 'grid_4x6')
-    cut_mode = source_job.cut_mode if source_job else (meta.get('cut_mode') or ('2x6' if str(print_mode) == 'double_strip' else 'none'))
+    cut_mode = source_job.cut_mode if source_job else (meta.get('cut_mode') or ('2x6' if str(print_mode) in ('double_strip', 'double_strip_horizontal') else 'none'))
 
     configured_name = data.get('printer_name') or get_config_value('printer_name', '')
     printer_name, printers = resolve_printer_name(configured_name)
