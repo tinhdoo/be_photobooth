@@ -59,9 +59,13 @@ def _load():
             print("[PrinterMedia] Khong tim thay cspstat64.dll", flush=True)
             return None
         dll = ctypes.WinDLL(path)
-        dll.GetPrinterPortNum.restype = ctypes.c_longlong
+        # Chữ ký lấy từ impl tham chiếu (FlashgoAI/DNPSDKService, StdCall). SDK trả 'long'
+        # 32-bit (Windows long) -> đọc bằng c_int để -1 ra đúng dấu.
+        dll.GetPrinterPortNum.restype = ctypes.c_int
         dll.GetPrinterPortNum.argtypes = [ctypes.c_char_p, ctypes.c_int]
-        dll.GetMediaCounter.restype = ctypes.c_longlong
+        dll.SetUSBTimeout.restype = ctypes.c_int
+        dll.SetUSBTimeout.argtypes = [ctypes.c_longlong, ctypes.c_longlong]
+        dll.GetMediaCounter.restype = ctypes.c_int
         dll.GetMediaCounter.argtypes = [ctypes.c_longlong]
         _dll = dll
         print(f"[PrinterMedia] Da load cspstat64.dll: {path}", flush=True)
@@ -86,21 +90,20 @@ def _probe_once():
         try:
             buf = ctypes.create_string_buffer(64)
             count = dll.GetPrinterPortNum(buf, 64)
-            first_bytes = list(buf.raw[:8])
-            sys.stderr.write(f"[probe] GetPrinterPortNum count={count} port_bytes={first_bytes}\n")
+            sys.stderr.write(f"[probe] GetPrinterPortNum count={count} bytes={list(buf.raw[:4])}\n")
             if count and count >= 1:
-                b = buf.raw
-                # Số cổng có thể 1/2/4 byte little-endian. Thử lần lượt, lấy giá trị hợp lệ đầu.
-                cands = []
-                for p in (b[0], b[0] | (b[1] << 8), int.from_bytes(b[0:4], "little")):
-                    if p not in cands:
-                        cands.append(p)
-                for port in cands:
-                    remaining = dll.GetMediaCounter(port)
-                    sys.stderr.write(f"[probe] GetMediaCounter(port={port}) -> {remaining}\n")
-                    if _is_valid(remaining):
-                        val = int(remaining)
-                        break
+                # Trình tự đúng (theo impl tham chiếu): port = INDEX 0 của máy in đầu tiên
+                # (buf[0]=DeviceID, buf[1]=UnitID chỉ là thông tin), PHẢI SetUSBTimeout trước
+                # khi đọc, KHÔNG gọi InitializePrinter.
+                port = 0
+                try:
+                    dll.SetUSBTimeout(port, 1000)
+                except Exception as e:
+                    sys.stderr.write(f"[probe] SetUSBTimeout loi: {e}\n")
+                remaining = dll.GetMediaCounter(port)
+                sys.stderr.write(f"[probe] GetMediaCounter(port={port}) -> {remaining}\n")
+                if _is_valid(remaining):
+                    val = int(remaining)
         except Exception as e:
             sys.stderr.write(f"[probe] loi: {e}\n")
             val = None
