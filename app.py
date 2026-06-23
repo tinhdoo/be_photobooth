@@ -5,6 +5,17 @@
 import multiprocessing
 multiprocessing.freeze_support()
 
+# Tiến trình con đọc số giấy máy in (cspstat) chạy CÁCH LY: backend spawn lại chính exe
+# với cờ --probe-media. Nếu DLL gây access violation thì chỉ tiến trình con này chết,
+# backend chính không hề hấn gì. Phải thoát TRƯỚC khi nạp Flask/cv2 và mở port 5000.
+import sys
+if "--probe-media" in sys.argv:
+    try:
+        from services.printer_media import _probe_once
+        _probe_once()
+    finally:
+        sys.exit(0)
+
 import eventlet
 eventlet.monkey_patch()
 
