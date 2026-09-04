@@ -32,3 +32,10 @@ instance/
 # OS
 .DS_Store
 Thumbs.db
+
+# Build output PyInstaller (~600MB, tai tao duoc)
+build/
+build_pyinstaller/
+dist/
+dist_pyinstaller/
+.launcher_requirements.stamp

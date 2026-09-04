@@ -5,6 +5,23 @@ import json
 from datetime import datetime
 from models import db, BillCashEntry, Config, DeviceConfig
 
+# eventlet.monkey_patch() biến thread này thành GREENLET -> mọi lệnh serial NATIVE (mở cổng / read /
+# write / in_waiting) sẽ CHẶN cả eventlet hub nếu cổng COM treo (điển hình khi USB power-cycle lúc
+# máy rảnh chờ khách quét QR) -> /api/print không trả kịp -> timeout 30s. Đẩy các lệnh serial CHẶN
+# sang tpool (thread OS thật) để hub KHÔNG bao giờ bị đóng băng. Vòng lặp/socketio/DB vẫn ở greenlet.
+try:
+    from eventlet import tpool as _tpool
+except Exception:
+    _tpool = None
+
+
+def _serial_io(func, *args, **kwargs):
+    """Chạy 1 lệnh serial blocking ở thread OS (tpool) -> không đóng băng eventlet hub.
+    Fallback gọi trực tiếp nếu không có eventlet (vd chạy ngoài server)."""
+    if _tpool is not None:
+        return _tpool.execute(func, *args, **kwargs)
+    return func(*args, **kwargs)
+
 class BillValidatorService:
     def __init__(self, app, socketio, device_id):
         self.app = app
@@ -39,7 +56,7 @@ class BillValidatorService:
         # Gửi lệnh ngay nếu serial đang mở (không cần đợi heartbeat power-up)
         try:
             if self.serial_conn and self.serial_conn.is_open:
-                self.serial_conn.write(self.enable_cmd if self.accepting else self.inhibit_cmd)
+                _serial_io(self.serial_conn.write, self.enable_cmd if self.accepting else self.inhibit_cmd)
         except Exception as e:
             print(f"[Bill] set_accepting write error: {e}", flush=True)
         return self.accepting
@@ -112,7 +129,7 @@ class BillValidatorService:
         self.thread = None
         if self.serial_conn:
             try:
-                self.serial_conn.close()
+                _serial_io(self.serial_conn.close)
             except:
                 pass
         self.serial_conn = None
@@ -153,7 +170,10 @@ class BillValidatorService:
                         elif p_val == 'EVEN':
                             serial_parity = serial.PARITY_EVEN
 
-                        self.serial_conn = serial.Serial(
+                        # Mở cổng qua tpool: đây là lệnh HAY TREO nhất khi COM ở trạng thái nửa vời
+                        # (vừa rớt/vừa cắm lại do USB power-cycle) -> phải chạy ở thread OS.
+                        self.serial_conn = _serial_io(
+                            serial.Serial,
                             port=self.port,
                             baudrate=self.baudrate,
                             parity=serial_parity,
@@ -162,7 +182,7 @@ class BillValidatorService:
                         print(f"[Bill] Serial Connected: {self.port} ({p_val})", flush=True)
                         # Đặt trạng thái LED/nhận tiền theo accepting hiện tại (mặc định: tắt)
                         try:
-                            self.serial_conn.write(self.enable_cmd if self.accepting else self.inhibit_cmd)
+                            _serial_io(self.serial_conn.write, self.enable_cmd if self.accepting else self.inhibit_cmd)
                         except Exception:
                             pass
                         self.socketio.emit('bill_status', {
@@ -189,9 +209,9 @@ class BillValidatorService:
                 # không chạy được -> port 5000 không mở, cả backend treo.
                 time.sleep(0.02)
 
-                # Read byte
-                if self.serial_conn.in_waiting > 0:
-                    byte = self.serial_conn.read(1)
+                # Read byte (in_waiting + read đều là lệnh native -> chạy qua tpool)
+                if _serial_io(getattr, self.serial_conn, 'in_waiting') > 0:
+                    byte = _serial_io(self.serial_conn.read, 1)
                     if byte:
                         hex_val = byte.hex().upper() # e.g. '40'
                         
@@ -205,9 +225,9 @@ class BillValidatorService:
                             cmd = self.enable_cmd if self.accepting else self.inhibit_cmd
                             print(f"[Bill] Power up ({hex_val}). ACK (02) + {'Enable' if self.accepting else 'Inhibit'}...", flush=True)
                             try:
-                                self.serial_conn.write(b'\x02')
+                                _serial_io(self.serial_conn.write, b'\x02')
                                 time.sleep(0.1)
-                                self.serial_conn.write(cmd)
+                                _serial_io(self.serial_conn.write, cmd)
                             except Exception as write_err:
                                 print(f"[Bill] Failed to write serial handshake: {write_err}", flush=True)
                             continue
@@ -220,7 +240,7 @@ class BillValidatorService:
                             if not self.accepting:
                                 print(f"[Bill] Bill {amount} VND nhưng chưa ở chế độ nhận -> reject (0F)", flush=True)
                                 try:
-                                    self.serial_conn.write(b'\x0F')
+                                    _serial_io(self.serial_conn.write, b'\x0F')
                                 except Exception as write_err:
                                     print(f"[Bill] Failed to send reject 0F: {write_err}", flush=True)
                                 continue
@@ -228,7 +248,7 @@ class BillValidatorService:
                             print(f"[Bill] Valid Bill: {amount} VND. Sending ACK (02) to stack...", flush=True)
 
                             try:
-                                self.serial_conn.write(b'\x02')
+                                _serial_io(self.serial_conn.write, b'\x02')
                             except Exception as write_err:
                                 print(f"[Bill] Failed to send stack ACK: {write_err}", flush=True)
 
@@ -248,7 +268,7 @@ class BillValidatorService:
                             if hex_val.startswith('4'):
                                 print(f"[Bill] Bill value code {hex_val} not mapped or accepted. Rejecting with 0F...", flush=True)
                                 try:
-                                    self.serial_conn.write(b'\x0F')
+                                    _serial_io(self.serial_conn.write, b'\x0F')
                                 except Exception as write_err:
                                     print(f"[Bill] Failed to send reject 0F: {write_err}", flush=True)
                             else:
@@ -263,6 +283,9 @@ class BillValidatorService:
                     'port': self.port
                 })
                 if self.serial_conn:
-                    self.serial_conn.close()
+                    try:
+                        _serial_io(self.serial_conn.close)
+                    except Exception:
+                        pass
                 self.serial_conn = None
                 time.sleep(2)

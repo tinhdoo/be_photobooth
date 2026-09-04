@@ -16,8 +16,21 @@ if "--probe-media" in sys.argv:
     finally:
         sys.exit(0)
 
+# Tiến trình con IN qua DNP SDK (cspstat64.dll) cũng chạy CÁCH LY: nếu DLL access violation
+# thì chỉ con chết, backend chính an toàn, caller rơi sang luồng GDI. Phải thoát TRƯỚC khi
+# nạp Flask/cv2 và mở port 5000.
+if "--print-sdk" in sys.argv:
+    try:
+        from services.printer_sdk import _print_child
+        _print_child()
+    finally:
+        sys.exit(0)
+
 import eventlet
 eventlet.monkey_patch()
+# tpool: chạy hàm BLOCKING NATIVE trong thread OS thật mà greenlet gọi vẫn nhường CPU.
+# Bắt buộc cho luồng in (GDI/numpy/DLL) - xem _print_image_with_config.
+from eventlet import tpool
 
 # Console Windows mặc định cp1252 không encode được tiếng Việt -> mọi print có dấu sẽ
 # crash (UnicodeEncodeError). Đặt errors='replace' để in an toàn, không bao giờ vỡ luồng.
@@ -35,6 +48,7 @@ logging.info("APP: STARTING UP...")
 print("APP: Importing libs...", flush=True)
 from flask import Flask, request, jsonify, send_from_directory, send_file
 import os
+import time
 try:
     from dotenv import load_dotenv
     load_dotenv(os.path.join(os.getcwd(), '.env'))
@@ -121,10 +135,23 @@ def request_entity_too_large(error):
 
 # Initialize Scheduler
 def run_with_context(fn):
-    """Wrapper to run a function inside Flask app context (required for background threads)."""
+    """Wrapper to run a function inside Flask app context (required for background threads).
+
+    Kèm ĐO THỜI LƯỢNG: eventlet.monkey_patch() vá cả threading nên "thread" của APScheduler thực
+    chất là GREENLET chạy chung loop -> file IO native trong job dọn dẹp sẽ CHẶN cả server suốt
+    thời gian đó (mọi request treo -> /api/print của khách có thể bị axios huỷ ở 30s). Log này để
+    đối chiếu: nếu lúc booth báo timeout mà thấy job chạy lâu ở đây -> đúng thủ phạm."""
     def wrapper():
-        with app.app_context():
-            fn()
+        t0 = time.monotonic()
+        try:
+            with app.app_context():
+                fn()
+        finally:
+            ms = int((time.monotonic() - t0) * 1000)
+            if ms > 1000:
+                logging.warning(f"[Scheduler] {fn.__name__} chay {ms}ms - CHAN loop eventlet suot thoi gian nay")
+            else:
+                logging.info(f"[Scheduler] {fn.__name__} chay {ms}ms")
     return wrapper
 
 scheduler = BackgroundScheduler(daemon=True)
@@ -460,7 +487,45 @@ def create_session():
     
     # Use provided session_id (which is a UUID from frontend QR code) or let DB generate
     session_uuid = data.get('session_id')
-    
+
+    # UPSERT theo uuid: Edit gọi endpoint này HAI LẦN cùng session_id — lần đầu (ảnh ghép, photos rỗng)
+    # để QR hiện ngay, lần sau ở NỀN kèm ảnh gốc + video motion. uuid là UNIQUE, nên nếu luôn tạo mới
+    # thì lần 2 dính IntegrityError -> ảnh lẻ/motion KHÔNG bao giờ vào album (khách quét QR chỉ thấy
+    # ảnh ghép). Đã có session cùng uuid -> CẬP NHẬT nó thay vì tạo trùng.
+    existing = Session.query.filter_by(uuid=session_uuid).first() if session_uuid else None
+    if existing:
+        if layout_id:
+            existing.layout_id = layout_id
+        if composite_url:
+            existing.composite_url = composite_url
+        if composite_public_id:
+            existing.composite_public_id = composite_public_id
+        if gif_url:
+            existing.gif_url = gif_url
+        if gif_public_id:
+            existing.gif_public_id = gif_public_id
+        if payment_method:
+            existing.payment_method = payment_method
+        if meta_data:
+            existing.meta_data = meta_data
+        # KHÔNG cộng dồn/ghi đè amount (2 lần gọi cùng 1 phiên) -> giữ nguyên để không thổi phồng
+        # doanh thu. Chỉ THAY ảnh khi lần gọi này thực sự có ảnh (lần nền) -> tránh xoá ảnh khi rỗng.
+        if photos_data:
+            Photo.query.filter_by(session_id=existing.id).delete()
+            for p in photos_data:
+                db.session.add(Photo(
+                    session_id=existing.id,
+                    file_path=p.get('url'),
+                    url=p.get('url'),
+                    video_url=p.get('video_url'),
+                    public_id=p.get('public_id'),
+                    video_public_id=p.get('video_public_id'),
+                    type=p.get('type', 'raw'),
+                    created_at=datetime.datetime.now(UTC),
+                ))
+        db.session.commit()
+        return jsonify(existing.to_dict()), 200
+
     # Create Session
     new_session = Session(
         uuid=session_uuid if session_uuid else uuid.uuid4().hex,
@@ -844,7 +909,8 @@ def upload_branding():
 @app.route('/api/printers', methods=['GET'])
 def list_printers():
     configured_name = get_config_value('printer_name', '')
-    resolved_name, printers = resolve_printer_name(configured_name)
+    # tpool: EnumPrinters là native blocking, chạy ở thread OS để KHÔNG đóng băng eventlet hub.
+    resolved_name, printers = tpool.execute(resolve_printer_name, configured_name)
     return jsonify({
         'printers': printers,
         'configured_printer': configured_name,
@@ -931,7 +997,9 @@ def get_camera_status():
 
 @app.route('/api/hardware/status', methods=['GET'])
 def hardware_status():
-    printer = get_printer_status(get_config_value('printer_name', ''))
+    # tpool: get_printer_status gọi EnumPrinters + SDK giấy (đều native blocking). Endpoint này bị
+    # watchdog poll định kỳ -> chạy ở thread OS để không đóng băng hub (nguồn treo /api/print).
+    printer = tpool.execute(get_printer_status, get_config_value('printer_name', ''))
     camera = get_camera_status()
     internet = check_internet_status()
     supabase = check_supabase_status()
@@ -953,21 +1021,166 @@ def hardware_status():
     }), 200
 
 
-@app.route('/api/kiosk/exit', methods=['POST'])
-def kiosk_exit():
-    # Thoát kiosk: đóng trình duyệt kiosk (Chrome/Edge) để staff về màn hình Windows.
-    # Backend vẫn chạy nền; mở lại kiosk bằng START_PHOTOBOOTH. Chỉ chạy trên Windows.
-    if os.name != 'nt':
-        return jsonify({'error': 'Chỉ hỗ trợ trên Windows'}), 400
+def _find_stop_script():
+    # tools/stop_photobooth.ps1 nằm cạnh thư mục chạy: release -> <root>/tools, dev -> <repo>/tools.
+    if getattr(sys, 'frozen', False):
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+    else:
+        exe_dir = os.path.dirname(os.path.abspath(__file__))
+    bases = [os.getcwd(), os.path.dirname(os.getcwd()), exe_dir, os.path.dirname(exe_dir)]
+    for base in bases:
+        candidate = os.path.join(base, 'tools', 'stop_photobooth.ps1')
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _shutdown_photobooth(stop_script):
+    # Chạy trong thread riêng để HTTP response kịp về trước khi tự tắt.
     import subprocess
-    closed = []
+    time.sleep(1.2)
+
     for exe in ('chrome.exe', 'msedge.exe'):
         try:
             subprocess.run(['taskkill', '/F', '/IM', exe], creationflags=subprocess.CREATE_NO_WINDOW, capture_output=True, timeout=5)
-            closed.append(exe)
         except Exception as e:
             print(f"[Kiosk] taskkill {exe} loi: {e}", flush=True)
-    return jsonify({'success': True, 'closed': closed}), 200
+
+    if stop_script:
+        try:
+            # DETACHED_PROCESS: script phải sống sót khi nó kill chính backend (port 5000).
+            subprocess.Popen(
+                ['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', stop_script],
+                cwd=os.path.dirname(os.path.dirname(stop_script)),
+                creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
+            )
+        except Exception as e:
+            print(f"[Kiosk] khong chay duoc stop script: {e}", flush=True)
+    else:
+        print("[Kiosk] khong tim thay tools/stop_photobooth.ps1, chi tu tat backend.", flush=True)
+        for exe in ('canon_middleware.exe',):
+            try:
+                subprocess.run(['taskkill', '/F', '/IM', exe], creationflags=subprocess.CREATE_NO_WINDOW, capture_output=True, timeout=5)
+            except Exception:
+                pass
+
+    # Chốt chặn: stop script lỗi thì backend vẫn phải tắt, không để lại tiến trình mồ côi.
+    time.sleep(8)
+    os._exit(0)
+
+
+def _find_chrome_path():
+    candidates = [
+        os.path.join(os.environ.get('ProgramFiles', r'C:\Program Files'), 'Google', 'Chrome', 'Application', 'chrome.exe'),
+        os.path.join(os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)'), 'Google', 'Chrome', 'Application', 'chrome.exe'),
+        os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Google', 'Chrome', 'Application', 'chrome.exe'),
+    ]
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _windowize_chrome_windows():
+    # Biến cửa sổ Chrome --kiosk (fullscreen, không viền) thành cửa sổ THƯỜNG có viền/thanh tiêu đề
+    # (di chuyển, thu nhỏ, phóng to được như mọi cửa sổ Windows) bằng WinAPI -> GIỮ NGUYÊN trang,
+    # KHÔNG mở lại Chrome (không tải lại). Không có thanh tab/địa chỉ vì kiosk ẩn UI của Chrome.
+    # Class name của mọi cửa sổ Chrome là Chrome_WidgetWin_1.
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    GWL_STYLE = -16
+    WS_OVERLAPPEDWINDOW = 0x00CF0000   # caption + sysmenu + viền + nút min/max
+    WS_VISIBLE = 0x10000000
+    WS_POPUP = 0x80000000
+    SW_SHOWNORMAL = 1
+    HWND_NOTOPMOST = -2
+    SWP_FRAMECHANGED = 0x0020
+    SWP_SHOWWINDOW = 0x0040
+
+    scr_w = user32.GetSystemMetrics(0)
+    scr_h = user32.GetSystemMetrics(1)
+    win_w = int(scr_w * 0.8)
+    win_h = int(scr_h * 0.85)
+    win_x = (scr_w - win_w) // 2
+    win_y = max(0, (scr_h - win_h) // 2 - 20)
+
+    changed = 0
+    WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+
+    def callback(hwnd, _lparam):
+        nonlocal changed
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        class_name = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, class_name, 256)
+        if class_name.value != 'Chrome_WidgetWin_1':
+            return True
+        if user32.GetWindowTextLengthW(hwnd) <= 0:
+            return True
+        title = ctypes.create_unicode_buffer(256)
+        user32.GetWindowTextW(hwnd, title, 256)
+        rb = wintypes.RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(rb))
+        # Bỏ kiểu fullscreen-borderless (WS_POPUP), thêm khung cửa sổ thường.
+        style = user32.GetWindowLongW(hwnd, GWL_STYLE) & 0xFFFFFFFF
+        new_style = (style & ~WS_POPUP) | WS_OVERLAPPEDWINDOW | WS_VISIBLE
+        user32.SetWindowLongW(hwnd, GWL_STYLE, new_style)
+        user32.ShowWindow(hwnd, SW_SHOWNORMAL)
+        # Đặt lại kích thước + bỏ topmost + áp dụng khung mới (SWP_FRAMECHANGED).
+        ok = user32.SetWindowPos(hwnd, HWND_NOTOPMOST, win_x, win_y, win_w, win_h, SWP_FRAMECHANGED | SWP_SHOWWINDOW)
+        ra = wintypes.RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(ra))
+        print(f"[Kiosk] win='{title.value}' style={style:#010x}->{new_style:#010x} "
+              f"size {rb.right-rb.left}x{rb.bottom-rb.top} -> {ra.right-ra.left}x{ra.bottom-ra.top} setpos_ok={ok}", flush=True)
+        changed += 1
+        return True
+
+    user32.EnumWindows(WNDENUMPROC(callback), 0)
+    return changed
+
+
+def _leave_kiosk_mode():
+    # Thoát kiosk -> biến cửa sổ kiosk hiện tại thành CỬA SỔ THƯỜNG có viền (di chuyển/thu nhỏ được),
+    # GIỮ NGUYÊN trang đang xem, KHÔNG mở lại Chrome (không tải lại). Chrome --kiosk có thể cố giành
+    # lại fullscreen nên thử vài lần. Về lại kiosk: mở lại bằng TomatoPhotobooth.exe.
+    time.sleep(0.6)  # cho HTTP response kịp về trước
+    for _ in range(5):
+        try:
+            if _windowize_chrome_windows() > 0:
+                print("[Kiosk] da chuyen cua so kiosk sang cua so thuong.", flush=True)
+                return
+        except Exception as e:
+            print(f"[Kiosk] khong chuyen duoc cua so: {e}", flush=True)
+            return
+        time.sleep(0.4)
+    print("[Kiosk] khong tim thay cua so chrome kiosk de chuyen.", flush=True)
+
+
+@app.route('/api/kiosk/windowed', methods=['POST'])
+def kiosk_windowed():
+    # Thoát CHẾ ĐỘ kiosk: biến cửa sổ hiện tại thành cửa sổ thường có viền (di chuyển/thu nhỏ được),
+    # GIỮ NGUYÊN trang (không tải lại). Backend + Canon vẫn chạy, mở lại kiosk bằng TomatoPhotobooth.exe.
+    if os.name != 'nt':
+        return jsonify({'error': 'Chỉ hỗ trợ trên Windows'}), 400
+
+    import threading
+    threading.Thread(target=_leave_kiosk_mode, daemon=True).start()
+    return jsonify({'success': True}), 200
+
+
+@app.route('/api/kiosk/exit', methods=['POST'])
+def kiosk_exit():
+    # Tắt hẳn phần mềm: đóng trình duyệt kiosk RỒI tắt backend + Canon middleware qua
+    # tools/stop_photobooth.ps1, để máy sạch cho phần mềm khác. Mở lại bằng TomatoPhotobooth.exe.
+    if os.name != 'nt':
+        return jsonify({'error': 'Chỉ hỗ trợ trên Windows'}), 400
+
+    import threading
+    stop_script = _find_stop_script()
+    threading.Thread(target=_shutdown_photobooth, args=(stop_script,), daemon=True).start()
+    return jsonify({'success': True, 'stopped_services': True, 'stop_script': stop_script}), 200
 
 
 @app.route('/api/printer/test', methods=['POST'])
@@ -975,7 +1188,7 @@ def test_printer():
     payload = request.json if request.is_json and request.json else {}
     configured_name = payload.get('printer_name')
     configured_name = configured_name or get_config_value('printer_name', '')
-    printer_name, printers = resolve_printer_name(configured_name)
+    printer_name, printers = tpool.execute(resolve_printer_name, configured_name)
 
     if not printer_name:
         return jsonify({
@@ -986,28 +1199,23 @@ def test_printer():
 
     try:
         print_folder = os.path.join(os.getcwd(), 'uploads', 'print_jobs')
-        color_settings = {
-            'print_brightness': payload.get('print_brightness', get_config_value('print_brightness', '0')),
-            'print_contrast': payload.get('print_contrast', get_config_value('print_contrast', '0')),
-            'print_saturation': payload.get('print_saturation', get_config_value('print_saturation', '0')),
-            'print_warmth': payload.get('print_warmth', get_config_value('print_warmth', '2')),
+        # Ảnh test NEUTRAL (màu gốc). Màu được áp lúc in qua cùng pipeline như in thật -> "In thử"
+        # phản ánh ĐÚNG ảnh in thật. Ưu tiên giá trị slider gửi kèm (preview cả khi CHƯA lưu),
+        # thiếu thì lấy từ config DB.
+        def _pick(key):
+            return payload.get(key, get_int_config(key, 0))
+        test_color = {
+            'brightness': _pick('print_brightness'),
+            'contrast': _pick('print_contrast'),
+            'saturation': _pick('print_saturation'),
+            'warmth': _pick('print_warmth'),
+            'red': _pick('print_red'),
+            'green': _pick('print_green'),
+            'blue': _pick('print_blue'),
         }
-        test_path = create_test_print_image(print_folder, color_settings)
-        
-        scale_x = get_int_config('print_scale_x', 100)
-        scale_y = get_int_config('print_scale_y', 100)
-        offset_x = get_int_config('print_offset_x', 0)
-        offset_y = get_int_config('print_offset_y', 0)
+        test_path = create_test_print_image(print_folder)
 
-        result = print_image_file(
-            test_path, 
-            printer_name, 
-            1, 
-            scale_x=scale_x, 
-            scale_y=scale_y, 
-            offset_x=offset_x, 
-            offset_y=offset_y
-        )
+        result = _print_image_with_config(test_path, printer_name, 1, 'none', color_settings=test_color)
         return jsonify({
             'success': True,
             'message': 'Đã gửi lệnh in thử.',
@@ -1018,8 +1226,137 @@ def test_printer():
         return jsonify({'error': str(e), 'printer': printer_name}), 500
 
 
+def _current_print_color_settings():
+    """Đọc chỉnh màu in từ config DB (mới nhất tại thời điểm in)."""
+    return {
+        'brightness': get_int_config('print_brightness', 0),
+        'contrast': get_int_config('print_contrast', 0),
+        'saturation': get_int_config('print_saturation', 0),
+        'warmth': get_int_config('print_warmth', 0),
+        'red': get_int_config('print_red', 0),
+        'green': get_int_config('print_green', 0),
+        'blue': get_int_config('print_blue', 0),
+    }
+
+
+def _print_config_kwargs(color_settings=None):
+    """Đọc TOÀN BỘ cấu hình in từ DB -> dict tham số THUẦN (sau đó không còn cần app context).
+    Tách riêng để phần in thật chạy được trong thread khác (tpool) mà không đụng DB/Flask."""
+    return dict(
+        scale_x=get_int_config('print_scale_x', 100),
+        scale_y=get_int_config('print_scale_y', 100),
+        offset_x=get_int_config('print_offset_x', 0),
+        offset_y=get_int_config('print_offset_y', 0),
+        # Độ nét bù cho máy dye-sub (như FlashgoAI). 0 = tắt. Áp cho cả SDK lẫn GDI.
+        sharpen=get_int_config('print_sharpen', 70),
+        # Chỉnh màu in áp lúc IN (đọc config MỚI NHẤT mỗi lần) -> in lại cũng theo slider hiện
+        # tại, màu KHÔNG bị đóng băng vào file. Frontend gửi ảnh in màu gốc.
+        color_settings=color_settings if color_settings is not None else _current_print_color_settings(),
+        # Tham số in trực tiếp qua DNP SDK (cspstat64.dll). print_use_sdk=1 -> thử SDK trước.
+        # MẶC ĐỊNH TẮT: luồng SDK kéo ảnh 1200x1800 (4x6 đúng chuẩn) lên 1844x1280 (khổ ĐÃ gồm
+        # mép tràn) nên máy in xén mất ~6% bề ngang mỗi strip -> cụt viền khung; nó cũng bỏ qua
+        # print_scale_*/print_offset_* nên không canh lại được. Chỉ bật khi buffer đã fit đúng
+        # vùng an toàn (kiểm tra bằng print_sdk_dryrun trước).
+        use_sdk=bool(get_int_config('print_use_sdk', 0)),
+        sdk_kwargs={
+            'model': get_config_value('print_sdk_model', 'RX1'),
+            'media': get_int_config('print_sdk_media', 3),          # 3=CSP_PC (RX1 4x6)
+            'resolution': get_int_config('print_sdk_resolution', 300),
+            'overcoat': get_int_config('print_sdk_overcoat', 0),    # 0=glossy
+            'width': get_int_config('print_sdk_width', 0),          # 0 -> tự tra bảng kích thước
+            'height': get_int_config('print_sdk_height', 0),
+            'dry_run': bool(get_int_config('print_sdk_dryrun', 0)), # 1 -> chỉ ghi buffer ra đĩa
+        },
+    )
+
+
+def _print_image_with_config(image_path, printer_name, copies, cut_mode, color_settings=None):
+    """In 1 file với TOÀN BỘ cấu hình in (độ nét + màu + tham số DNP SDK) -> mọi đường in
+    (in mới, in lại, in thử) đều nhất quán, cùng luồng SDK-chính/GDI-dự-phòng.
+    color_settings=None -> đọc từ config DB; truyền vào để ghi đè (vd in thử preview slider).
+
+    PHẦN IN CHẠY TRONG THREAD OS THẬT (eventlet.tpool). Vì sao BẮT BUỘC: việc in đi qua GDI
+    (win32ui), numpy và DLL — toàn lời gọi NATIVE, KHÔNG nhường cho eventlet. Chạy thẳng trong
+    greenlet sẽ ĐÓNG BĂNG cả server suốt thời gian in (15–60s) -> mọi request treo -> /api/print
+    của lượt kế tiếp bị axios huỷ ở 30s ("Không thể in ảnh: timeout of 30000ms exceeded").
+    tpool đẩy sang thread OS nên hub eventlet vẫn rảnh để trả lời request.
+    Config PHẢI đọc TẠI ĐÂY (còn app context) — thread tpool không được đụng DB/Flask."""
+    kwargs = _print_config_kwargs(color_settings)
+    return tpool.execute(print_image_file, image_path, printer_name, copies,
+                         cut_mode=cut_mode, **kwargs)
+
+
+# --- HÀNG ĐỢI IN (bất đồng bộ, TUẦN TỰ) ---
+# /api/print xếp job vào đây rồi TRẢ VỀ NGAY -> khách KHÔNG chờ in xong (hết timeout 30s oan). Một
+# green consumer lấy từng job in lần lượt -> KHÔNG chồng nhau ra USB (fix in trùng/kẹt do 2 job song
+# song). Việc in native chạy qua tpool (xem _print_image_with_config) nên KHÔNG đóng băng server; app
+# context riêng cho consumer để đọc config + cập nhật trạng thái PrintJob (panel nhân viên thấy để in lại).
+from eventlet.queue import Queue as _EvtQueue
+_print_queue = _EvtQueue()
+_print_consumer_started = False
+
+
+def _print_consumer_loop():
+    # Vòng lặp KHÔNG ĐƯỢC CHẾT: nếu greenlet consumer chết thì _print_consumer_started vẫn = True
+    # -> không ai spawn lại -> mọi lệnh in kẹt 'pending' mãi. Bọc TOÀN BỘ mỗi vòng trong try.
+    while True:
+        try:
+            task = _print_queue.get()
+            job_id = task.get('job_id') if isinstance(task, dict) else None
+            # Log MỐC BẮT ĐẦU + số job còn chờ: khi booth báo "timeout of 30000ms", đối chiếu giờ
+            # sẽ biết ngay lúc đó có đang in hay không (=> request bị chặn vì loop bận).
+            t0 = time.monotonic()
+            print(f"[PrintQueue] Job {job_id}: BAT DAU in (con {_print_queue.qsize()} job cho)", flush=True)
+            logging.info(f"[PrintQueue] Job {job_id}: BAT DAU in (queue={_print_queue.qsize()})")
+            try:
+                with app.app_context():
+                    result = _print_image_with_config(task['path'], task['printer'], task['copies'], task['cut_mode'])
+                    j = db.session.get(PrintJob, job_id) if job_id else None
+                    if j:
+                        j.status = 'sent'
+                        if isinstance(result, dict) and result.get('printer'):
+                            j.printer_name = result['printer']
+                        db.session.commit()
+                ms = int((time.monotonic() - t0) * 1000)
+                print(f"[PrintQueue] Job {job_id}: da in xong sau {ms}ms.", flush=True)
+                logging.info(f"[PrintQueue] Job {job_id}: da in xong sau {ms}ms")
+            except Exception as e:
+                logging.exception("Print queue job failed")
+                try:
+                    with app.app_context():
+                        j = db.session.get(PrintJob, job_id) if job_id else None
+                        if j:
+                            j.status = 'failed'
+                            j.error_message = str(e)[:500]
+                            db.session.commit()
+                except Exception:
+                    logging.exception("Cannot mark print job failed")
+        except Exception:
+            # Lỗi bất ngờ (get/parse) -> log + ngủ ngắn, KHÔNG thoát vòng (giữ consumer sống).
+            logging.exception("Print consumer loop iteration crashed")
+            eventlet.sleep(0.5)
+
+
+def _ensure_print_consumer():
+    global _print_consumer_started
+    if not _print_consumer_started:
+        _print_consumer_started = True
+        eventlet.spawn(_print_consumer_loop)
+
+
+def _enqueue_print(job_id, path, printer, copies, cut_mode):
+    _ensure_print_consumer()
+    _print_queue.put({'job_id': job_id, 'path': path, 'printer': printer, 'copies': copies, 'cut_mode': cut_mode})
+
+
 @app.route('/api/print', methods=['POST'])
 def print_photo():
+    # ĐO THỜI GIAN TỪNG BƯỚC: frontend huỷ request này ở 30s ("timeout of 30000ms exceeded").
+    # Lỗi hiếm + không tái hiện được -> log mốc để lần sau biết CHÍNH XÁC bước nào chậm, hay cả
+    # request bị treo do loop eventlet đang bận (đối chiếu với log [PrintQueue]/[Scheduler]).
+    _t_start = time.monotonic()
+    _ms = lambda: int((time.monotonic() - _t_start) * 1000)
+
     if 'file' not in request.files:
         return jsonify({'error': 'No file part'}), 400
 
@@ -1036,7 +1373,11 @@ def print_photo():
     print_mode = request.form.get('print_mode') or 'grid_4x6'
     cut_mode = request.form.get('cut_mode') or 'none'
     session_uuid = request.form.get('session_id') or request.form.get('session_uuid')
-    printer_name, printers = resolve_printer_name(configured_name)
+    _ms_form = _ms()
+    # tpool: dò máy in (EnumPrinters) chạy ở thread OS -> spooler/máy in chậm KHÔNG treo hub ->
+    # /api/print luôn trả kịp, hết lỗi "timeout of 30000ms exceeded".
+    printer_name, printers = tpool.execute(resolve_printer_name, configured_name)
+    _ms_resolve = _ms()
     print_job = PrintJob(
         session_uuid=session_uuid,
         printer_name=printer_name or configured_name,
@@ -1061,37 +1402,37 @@ def print_photo():
 
     try:
         print_folder = os.path.join(os.getcwd(), 'uploads', 'print_jobs')
-        # Bỏ làm nét (UnsharpMask) -> in giữ nguyên chất lượng/độ nét ảnh gốc.
+        # Lưu file in ở chất lượng cao, KHÔNG làm nét tại đây (giữ file gốc raw). Làm nét
+        # được áp ở bước render cuối của TỪNG luồng in (SDK build buffer / GDI resize) để
+        # tránh làm nét 2 lần.
         saved_path = save_print_image(file, print_folder, sharpen=0)
+        _ms_save = _ms()
         print_job.file_path = saved_path
         print_job.printer_name = printer_name
         db.session.commit()
 
-        scale_x = get_int_config('print_scale_x', 100)
-        scale_y = get_int_config('print_scale_y', 100)
-        offset_x = get_int_config('print_offset_x', 0)
-        offset_y = get_int_config('print_offset_y', 0)
+        # XẾP HÀNG in nền -> trả về NGAY (khách không chờ in xong). In thật + cập nhật status 'sent'/
+        # 'failed' do consumer lo; lỗi in hiện ở panel nhân viên (job 'failed') để in lại.
+        _enqueue_print(print_job.id, saved_path, printer_name, copies_int, cut_mode)
 
-        result = print_image_file(
-            saved_path, 
-            printer_name, 
-            copies_int, 
-            cut_mode=cut_mode,
-            scale_x=scale_x,
-            scale_y=scale_y,
-            offset_x=offset_x,
-            offset_y=offset_y
-        )
-        print_job.status = 'sent'
-        db.session.commit()
+        # Mốc thời gian: form=đọc/nhận file, resolve=dò máy in, save=giải mã PNG+lưu JPEG, total=cả request.
+        # total gần 30s -> khách sẽ thấy "timeout of 30000ms exceeded". Nếu total lớn mà các bước đều
+        # nhỏ => request bị TREO vì loop eventlet bận việc khác (xem log [PrintQueue]/[Scheduler]).
+        _msg = (f"[Print] /api/print job={print_job.id} form={_ms_form}ms resolve={_ms_resolve}ms "
+                f"save={_ms_save}ms total={_ms()}ms queue={_print_queue.qsize()}")
+        print(_msg, flush=True)
+        if _ms() > 5000:
+            logging.warning(_msg + "  <-- CHAM BAT THUONG (nguong 5s, frontend huy o 30s)")
+        else:
+            logging.info(_msg)
         return jsonify({
             'success': True,
-            'message': 'Đã gửi ảnh sang máy in.',
-            'job': print_job.to_dict(),
-            **result
+            'message': 'Đã xếp hàng in.',
+            'queued': True,
+            'job': print_job.to_dict()
         }), 200
     except Exception as e:
-        logging.exception("Print job failed")
+        logging.exception("Print enqueue failed")
         print_job.status = 'failed'
         print_job.error_message = str(e)[:500]
         db.session.commit()
@@ -1283,7 +1624,7 @@ def staff_reprint_session(session_uuid):
     cut_mode = source_job.cut_mode if source_job else (meta.get('cut_mode') or ('2x6' if str(print_mode) in ('double_strip', 'double_strip_horizontal') else 'none'))
 
     configured_name = data.get('printer_name') or get_config_value('printer_name', '')
-    printer_name, printers = resolve_printer_name(configured_name)
+    printer_name, printers = tpool.execute(resolve_printer_name, configured_name)
     print_job = PrintJob(
         session_uuid=session_uuid,
         file_path=source_path,
@@ -1307,32 +1648,17 @@ def staff_reprint_session(session_uuid):
         }), 500
 
     try:
-        scale_x = get_int_config('print_scale_x', 100)
-        scale_y = get_int_config('print_scale_y', 100)
-        offset_x = get_int_config('print_offset_x', 0)
-        offset_y = get_int_config('print_offset_y', 0)
-
-        result = print_image_file(
-            source_path, 
-            printer_name, 
-            copies, 
-            cut_mode=cut_mode,
-            scale_x=scale_x,
-            scale_y=scale_y,
-            offset_x=offset_x,
-            offset_y=offset_y
-        )
-        print_job.status = 'sent'
-        print_job.printer_name = printer_name
-        db.session.commit()
+        # In lại cũng qua HÀNG ĐỢI -> nối tiếp với in của khách (không chồng USB) + trả về ngay.
+        # Trạng thái 'sent'/'failed' do consumer cập nhật; panel nhân viên tự làm mới theo job.
+        _enqueue_print(print_job.id, source_path, printer_name, copies, cut_mode)
         return jsonify({
             'success': True,
-            'message': 'Da gui lenh in lai.',
-            'job': print_job.to_dict(),
-            **result
+            'message': 'Da xep hang in lai.',
+            'queued': True,
+            'job': print_job.to_dict()
         }), 200
     except Exception as e:
-        logging.exception("Staff reprint failed")
+        logging.exception("Staff reprint enqueue failed")
         print_job.status = 'failed'
         print_job.error_message = str(e)[:500]
         db.session.commit()
@@ -1356,12 +1682,13 @@ def staff_session_print_image(session_uuid):
 
 @app.route('/api/codes/generate', methods=['POST'])
 def generate_codes():
+    MAX_CODES_PER_BATCH = 100
+    MAX_CODES_TOTAL = 500
+
     data = request.json
-    value = int(data.get('value', 0))
-    quantity = int(data.get('quantity', 1))
     expires_at_str = data.get('expires_at')
     expires_at = None
-    
+
     if expires_at_str:
         try:
             # Handle ISO format from frontend
@@ -1376,25 +1703,52 @@ def generate_codes():
         if duration_minutes > 0:
             expires_at = datetime.datetime.now(UTC) + datetime.timedelta(minutes=duration_minutes)
 
+    # Hỗ trợ 2 dạng payload:
+    #  - Nhiều mệnh giá: { batches: [{ value, quantity }, ...] }
+    #  - Một mệnh giá (cũ):  { value, quantity }
+    raw_batches = data.get('batches')
+    if isinstance(raw_batches, list):
+        batches = [
+            {
+                'value': int(b.get('value', 0)),
+                'quantity': max(1, min(MAX_CODES_PER_BATCH, int(b.get('quantity', 1)))),
+            }
+            for b in raw_batches
+        ]
+    else:
+        batches = [{
+            'value': int(data.get('value', 0)),
+            'quantity': max(1, min(MAX_CODES_PER_BATCH, int(data.get('quantity', 1)))),
+        }]
+
+    batches = [b for b in batches if b['value'] > 0 and b['quantity'] > 0]
+    if not batches:
+        return jsonify({'error': 'Invalid code value'}), 400
+
+    total = sum(b['quantity'] for b in batches)
+    if total > MAX_CODES_TOTAL:
+        return jsonify({'error': f'Tổng số mã vượt quá giới hạn {MAX_CODES_TOTAL}.'}), 400
+
     generated = []
-    
+
     try:
-        for _ in range(quantity):
-            # Generate unique 6 digit code
-            attempts = 0
-            while attempts < 10:
-                code = ''.join(random.choices(string.digits, k=6))
-                if not PaymentCode.query.filter_by(code=code).first():
-                    new_code = PaymentCode(
-                        code=code,
-                        value=value,
-                        expires_at=expires_at
-                    )
-                    db.session.add(new_code)
-                    generated.append(new_code)
-                    break
-                attempts += 1
-        
+        for batch in batches:
+            for _ in range(batch['quantity']):
+                # Generate unique 6 digit code
+                attempts = 0
+                while attempts < 10:
+                    code = ''.join(random.choices(string.digits, k=6))
+                    if not PaymentCode.query.filter_by(code=code).first():
+                        new_code = PaymentCode(
+                            code=code,
+                            value=batch['value'],
+                            expires_at=expires_at
+                        )
+                        db.session.add(new_code)
+                        generated.append(new_code)
+                        break
+                    attempts += 1
+
         db.session.commit()
         return jsonify([c.to_dict() for c in generated]), 201
     except Exception as e:
@@ -1694,8 +2048,15 @@ def test_disconnect():
             del connected_devices[d_id]
             break
 # Device Management
+# Lần cuối GIAO DIỆN kiosk còn sống (frontend gọi heartbeat mỗi 60s). Watchdog dựa vào đây để
+# phân biệt "Chrome còn chạy" với "Chrome còn chạy nhưng trang đã đơ" - trường hợp thứ hai nhìn
+# từ ngoài y hệt bình thường: process còn, cửa sổ còn, chỉ có khách là bấm mãi không ăn.
+_last_ui_heartbeat = time.monotonic()
+
 @app.route('/api/devices/heartbeat', methods=['POST'])
 def device_heartbeat():
+    global _last_ui_heartbeat
+    _last_ui_heartbeat = time.monotonic()
     data = request.json
     device_id = data.get('deviceId')
     
@@ -1712,7 +2073,14 @@ def device_heartbeat():
     name = data.get('name')
     if name and not device.name:
         device.name = name
-    
+
+    # Lưu BỀN chế độ khi client gửi kèm 'mode' (nút gạt Event/Payment trên booth). Heartbeat
+    # định kỳ KHÔNG gửi mode -> không đụng tới giá trị đang có. Nhờ vậy lựa chọn của nhân viên
+    # được ghi vào DB, không bị heartbeat sau đọc mode cũ rồi revert.
+    mode = data.get('mode')
+    if mode in ('event', 'payment'):
+        device.mode = mode
+
     device.last_active = datetime.datetime.now(UTC)
     db.session.commit()
     
@@ -1788,6 +2156,7 @@ def init_configs():
         {'key': 'print_scale_y', 'value': '100'},
         {'key': 'print_offset_x', 'value': '0'},
         {'key': 'print_offset_y', 'value': '0'},
+        {'key': 'print_use_sdk', 'value': '0'}, # 1 = in qua DNP SDK (đang cắt viền), 0 = GDI
     ]
     
     for item in defaults:
@@ -2135,6 +2504,19 @@ def set_bill_accept():
     accepting = bool(data.get('accepting', False))
     if not bill_service:
         return jsonify({'accepting': False, 'error': 'Bill service not initialized'}), 200
+
+    # Lưới an toàn cuối: khách tới bước thanh toán mà booth còn kẹt ở trạng thái tạm ngưng (vd
+    # frontend reload lỡ nhịp) -> bật lại luồng đọc serial trước, nếu không set_accepting sẽ ghi
+    # vào cổng đã đóng và máy đọc tiền im lặng không nhận tờ nào.
+    global _idle_suspended
+    if accepting and _idle_suspended:
+        print("[Idle] Co yeu cau nhan tien khi dang tam ngung -> bat lai bill service.", flush=True)
+        _idle_suspended = False
+        try:
+            bill_service.start()
+        except Exception as e:
+            print(f"[Idle] Bat lai bill service loi: {e}", flush=True)
+
     bill_service.set_accepting(accepting)
     return jsonify({'accepting': bill_service.accepting}), 200
 
@@ -2153,6 +2535,91 @@ def get_bill_status():
         'status': status,
         'device_id': get_device_id()
     })
+
+# --- TẠM NGƯNG KHI RẢNH (để Windows được ngủ) ---
+_idle_suspended = False
+
+@app.route('/api/system/health', methods=['GET'])
+def system_health():
+    """Watchdog (tools/watchdog.ps1) gọi mỗi phút để biết booth còn phục vụ được không.
+
+    Chỉ cần route này TRẢ LỜI ĐƯỢC là đã chứng minh nhiều thứ: tiến trình còn sống VÀ eventlet
+    loop chưa bị chặn. Backend treo (job dọn dẹp chiếm loop, greenlet kẹt...) thì request này
+    treo theo -> watchdog timeout -> đúng cái cần phát hiện. Vì vậy TUYỆT ĐỐI không làm gì nặng
+    trong đây.
+    """
+    try:
+        # CHỈ đếm lệnh in vừa tạo gần đây. Job đi theo đường pending -> sent/failed, nhưng nếu
+        # consumer chết giữa chừng thì job nằm 'pending' VĨNH VIỄN -> watchdog tưởng máy đang in
+        # mãi và không bao giờ dám cứu giao diện đơ nữa. Quá 10 phút coi như kẹt, không phải đang in.
+        cutoff = (datetime.datetime.now(UTC) - datetime.timedelta(minutes=10)).replace(tzinfo=None)
+        busy_prints = PrintJob.query.filter(
+            PrintJob.status == 'pending',
+            PrintJob.created_at >= cutoff
+        ).count()
+    except Exception:
+        busy_prints = 0
+    try:
+        c = Config.query.filter_by(key='camera_mode').first()
+        camera_mode = c.value if c else 'canon'
+    except Exception:
+        camera_mode = 'canon'
+
+    return jsonify({
+        'ok': True,
+        'idle': _idle_suspended,
+        # Tuổi của heartbeat giao diện (giây). Watchdog BỎ QUA số này khi idle=true, vì lúc tạm
+        # ngưng chờ máy ngủ thì frontend cố tình không gửi heartbeat nữa - không phải đơ.
+        'ui_heartbeat_age': int(time.monotonic() - _last_ui_heartbeat),
+        'busy_prints': busy_prints,
+        'camera_mode': camera_mode,
+    }), 200
+
+@app.route('/api/system/idle', methods=['GET', 'POST'])
+def system_idle_api():
+    """Frontend gọi khi booth đứng ở Welcome quá lâu không ai chạm (và gọi lại khi khách chạm).
+
+    KHÔNG ép máy sleep: thời điểm ngủ vẫn do power plan Windows quyết định. Việc ở đây chỉ là
+    NHẢ những thứ đang giữ máy thức / sẽ hỏng khi máy ngủ:
+      - Video nền Welcome: frontend tự pause (thứ THỰC SỰ chặn sleep, xem Welcome.jsx).
+      - Cổng serial máy đọc tiền: đóng chủ động. Khi máy ngủ, USB bị re-enumerate nên handle
+        pyserial chết -> nếu để nguyên, lúc wake vòng đọc sẽ ném exception và spam log 2s/lần
+        cho tới khi tự nối lại. Đóng trước rồi start() lại lúc wake thì sạch hơn.
+    Máy ảnh Canon không cần đụng: middleware tự đóng phiên EDSDK sau 10 phút rảnh.
+    """
+    global _idle_suspended
+
+    if request.method == 'GET':
+        return jsonify({
+            'idle': _idle_suspended,
+            'bill_running': bool(bill_service and bill_service.running)
+        }), 200
+
+    idle = bool((request.json or {}).get('idle', False))
+
+    # Chốt chặn: đang mở nhận tiền = khách đứng ở bước thanh toán -> TUYỆT ĐỐI không đóng cổng
+    # serial (khách nhét tiền vào sẽ mất trắng). Frontend đã chặn rồi, đây là lớp thứ hai.
+    if idle and bill_service and bill_service.accepting:
+        print("[Idle] Bo qua yeu cau tam ngung: dang mo nhan tien mat.", flush=True)
+        return jsonify({'idle': False, 'skipped': 'bill_accepting'}), 200
+
+    if idle != _idle_suspended:
+        _idle_suspended = idle
+        if bill_service:
+            try:
+                if idle:
+                    bill_service.set_accepting(False)  # gửi inhibit khi cổng còn mở
+                    bill_service.stop()
+                else:
+                    bill_service.start()  # start() tự load_config, bỏ qua nếu bill_enabled=false
+            except Exception as e:
+                print(f"[Idle] Bill service {'stop' if idle else 'start'} loi: {e}", flush=True)
+        print(f"[Idle] Booth {'TAM NGUNG (cho phep Windows sleep)' if idle else 'HOAT DONG TRO LAI'}", flush=True)
+
+    return jsonify({
+        'idle': _idle_suspended,
+        'bill_running': bool(bill_service and bill_service.running)
+    }), 200
 
 @app.route('/api/bill/history', methods=['GET'])
 def get_bill_history():
@@ -2216,7 +2683,10 @@ def register_current_device():
     device_id = get_device_id()
     device = Device.query.filter_by(device_id=device_id).first()
     if not device:
-        device = Device(device_id=device_id, name=f"Device {device_id}", mode='event')
+        # Booth trả tiền là mặc định. Trước đây ép mode='event' -> máy mới tự đăng ký rơi vào chế độ
+        # sự kiện (miễn phí) -> BỎ QUA bước Thanh toán, đi thẳng Layout -> Chụp. Dùng 'payment' cho
+        # khớp default của model Device và endpoint heartbeat; muốn event thì đổi qua Admin.
+        device = Device(device_id=device_id, name=f"Device {device_id}", mode='payment')
         db.session.add(device)
     else:
         device.last_active = datetime.datetime.now(timezone.utc)

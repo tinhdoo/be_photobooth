@@ -1,10 +1,12 @@
 import os
 import subprocess
+import tempfile
+import threading
 import time
 import uuid
 from io import BytesIO
 
-from PIL import Image, ImageEnhance, ImageOps, ImageFilter
+from PIL import Image, ImageOps, ImageFilter
 
 
 PREFERRED_PRINTER_KEYWORDS = ("RX1HS", "DS-RX1", "RX1", "DNP")
@@ -101,7 +103,15 @@ def _get_printers_powershell():
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
 
-def get_available_printers():
+# Cache danh sách máy in: EnumPrinters là lệnh native CHẶN (blocking) và đôi khi treo vài chục
+# giây (spooler bận / máy in vừa ngủ). Cache theo thời gian để nhiều lệnh gọi liên tiếp (health
+# poll ~15s + lệnh in) không phải liệt kê lại mỗi lần -> giảm mạnh số lần chạm native.
+_PRINTER_CACHE_TTL = 20.0  # giây
+_printer_cache = {"ts": 0.0, "printers": None}
+_printer_cache_lock = threading.Lock()
+
+
+def _enumerate_printers():
     try:
         import win32print
 
@@ -111,8 +121,27 @@ def get_available_printers():
         return _get_printers_powershell()
 
 
-def resolve_printer_name(configured_name=None):
-    printers = get_available_printers()
+def get_available_printers(force=False):
+    """Danh sách máy in, có cache TTL. force=True để bỏ cache, liệt kê lại ngay.
+
+    Lưu ý: hàm này CHẶN khi cache hết hạn (gọi EnumPrinters). Trên server eventlet, hãy gọi
+    qua tpool.execute(...) để không đóng băng hub."""
+    now = time.monotonic()
+    with _printer_cache_lock:
+        cached = _printer_cache["printers"]
+        if not force and cached is not None and (now - _printer_cache["ts"]) < _PRINTER_CACHE_TTL:
+            return cached
+
+    printers = _enumerate_printers()
+
+    with _printer_cache_lock:
+        _printer_cache["printers"] = printers
+        _printer_cache["ts"] = time.monotonic()
+    return printers
+
+
+def resolve_printer_name(configured_name=None, force=False):
+    printers = get_available_printers(force=force)
     if configured_name:
         exact = next((name for name in printers if name.lower() == configured_name.lower()), None)
         if exact:
@@ -212,7 +241,7 @@ def _rotate_to_match_page(image, page_width, page_height):
     return image
 
 
-def _print_with_windows_dc(image_path, printer_name, copies, cut_mode="none", scale_x=100, scale_y=100, offset_x=0, offset_y=0):
+def _print_with_windows_dc(image_path, printer_name, copies, cut_mode="none", scale_x=100, scale_y=100, offset_x=0, offset_y=0, sharpen=0):
     import win32con
     import win32ui
     from PIL import ImageWin
@@ -273,6 +302,13 @@ def _print_with_windows_dc(image_path, printer_name, copies, cut_mode="none", sc
         target_w = max(1, int(round(new_w)))
         target_h = max(1, int(round(new_h)))
         render_image = page_image.resize((target_w, target_h), Image.LANCZOS)
+        # Làm nét sau khi resize đúng kích thước in để bù độ mềm của máy dye-sub (giống SDK).
+        try:
+            amount = max(0, min(200, int(sharpen)))
+        except Exception:
+            amount = 0
+        if amount > 0:
+            render_image = render_image.filter(ImageFilter.UnsharpMask(radius=1.2, percent=amount, threshold=3))
         dib = ImageWin.Dib(render_image)
 
         left = int(round(center_x - target_w / 2))
@@ -297,7 +333,67 @@ def _print_with_windows_dc(image_path, printer_name, copies, cut_mode="none", sc
         dc.DeleteDC()
 
 
-def print_image_file(image_path, printer_name, copies=1, cut_mode="none", scale_x=100, scale_y=100, offset_x=0, offset_y=0):
+def _color_int(settings, key):
+    try:
+        return int(float((settings or {}).get(key, 0) or 0))
+    except Exception:
+        return 0
+
+
+def apply_print_color_to_file(image_path, settings):
+    """Áp chỉnh màu in (sáng/tương phản/bão hòa/ấm + R/G/B) lên ảnh, GHI RA FILE TẠM và trả
+    đường dẫn. KHÔNG đụng file gốc -> in lại đọc config MỚI mỗi lần (màu không bị đóng băng).
+    Trả None nếu mọi giá trị = 0 (không cần xử lý). Công thức KHỚP với frontend cũ để màu
+    nhất quán dù canh bằng slider nào."""
+    brightness = _color_int(settings, "brightness")
+    contrast = _color_int(settings, "contrast")
+    saturation = _color_int(settings, "saturation")
+    warmth = _color_int(settings, "warmth")
+    red = _color_int(settings, "red")
+    green = _color_int(settings, "green")
+    blue = _color_int(settings, "blue")
+
+    if not any((brightness, contrast, saturation, warmth, red, green, blue)):
+        return None
+
+    import numpy as np
+
+    img = Image.open(image_path)
+    img = ImageOps.exif_transpose(img).convert("RGB")
+    arr = np.asarray(img, dtype=np.float32)
+    r = arr[:, :, 0]
+    g = arr[:, :, 1]
+    b = arr[:, :, 2]
+
+    contrast_value = max(-80.0, min(80.0, contrast * 2.0))
+    contrast_factor = (259.0 * (contrast_value + 255.0)) / (255.0 * (259.0 - contrast_value))
+    saturation_factor = 1.0 + (saturation / 100.0)
+
+    r = r + brightness + warmth + red
+    g = g + brightness + (warmth * 0.25) + green
+    b = b + brightness - warmth + blue
+
+    r = contrast_factor * (r - 128.0) + 128.0
+    g = contrast_factor * (g - 128.0) + 128.0
+    b = contrast_factor * (b - 128.0) + 128.0
+
+    gray = 0.299 * r + 0.587 * g + 0.114 * b
+    r = gray + (r - gray) * saturation_factor
+    g = gray + (g - gray) * saturation_factor
+    b = gray + (b - gray) * saturation_factor
+
+    out = np.clip(np.stack([r, g, b], axis=2), 0, 255).astype(np.uint8)
+
+    fd, tmp_path = tempfile.mkstemp(prefix="print_color_", suffix=".jpg")
+    os.close(fd)
+    Image.fromarray(out, "RGB").save(tmp_path, "JPEG", quality=95, subsampling=0)
+    print(f"[Print] Da ap mau in: B={brightness} C={contrast} S={saturation} W={warmth} "
+          f"R={red} G={green} B={blue} -> {tmp_path}", flush=True)
+    return tmp_path
+
+
+def print_image_file(image_path, printer_name, copies=1, cut_mode="none", scale_x=100, scale_y=100, offset_x=0, offset_y=0,
+                     sharpen=0, use_sdk=True, sdk_kwargs=None, color_settings=None):
     if os.name != "nt":
         raise RuntimeError("Chỉ hỗ trợ in trực tiếp trên Windows.")
 
@@ -307,15 +403,64 @@ def print_image_file(image_path, printer_name, copies=1, cut_mode="none", scale_
     if not os.path.exists(image_path):
         raise FileNotFoundError(image_path)
 
-    method = "windows_dc"
-    # KHÔNG fallback sang mspaint: mspaint in "fit to page" -> letterbox VIỀN TRẮNG (khác
-    # full-bleed), dùng Popen không chờ/không bắt lỗi (luôn coi như thành công), và nếu
-    # windows_dc đã spool được vài bản rồi mới lỗi thì mspaint in lại đủ copies -> IN TRÙNG.
-    # Thà để lỗi ném ra ngoài để endpoint đánh dấu PrintJob 'failed' và in lại có kiểm soát.
-    _print_with_windows_dc(image_path, printer_name, copies, cut_mode, scale_x, scale_y, offset_x, offset_y)
+    # Áp chỉnh màu in từ config HIỆN TẠI lên 1 file TẠM (không nung vào file gốc) -> in mới lẫn
+    # in lại đều theo config mới nhất. Lỗi -> bỏ qua, in màu gốc, không vỡ luồng in.
+    render_path = image_path
+    temp_color_path = None
+    try:
+        temp_color_path = apply_print_color_to_file(image_path, color_settings)
+        if temp_color_path:
+            render_path = temp_color_path
+    except Exception as exc:
+        print(f"[Print] Bo qua chinh mau in (loi): {exc}", flush=True)
+
+    try:
+        result = _do_print_image(render_path, printer_name, copies, cut_mode, scale_x, scale_y,
+                                 offset_x, offset_y, sharpen, use_sdk, sdk_kwargs)
+        result["file_path"] = image_path  # trả file GỐC, không phải file màu tạm (đã xóa)
+        return result
+    finally:
+        if temp_color_path:
+            try:
+                os.remove(temp_color_path)
+            except Exception:
+                pass
+
+
+def _do_print_image(image_path, printer_name, copies, cut_mode, scale_x, scale_y,
+                    offset_x, offset_y, sharpen, use_sdk, sdk_kwargs):
+    method = None
+    sdk_error = None
+    # 1) Ưu tiên in TRỰC TIẾP qua DNP SDK (cspstat64.dll) -> nét như FlashgoAI. Chạy cách ly
+    #    trong tiến trình con; nếu thất bại/không có máy -> rơi sang GDI bên dưới.
+    if use_sdk:
+        try:
+            from services.printer_sdk import print_via_sdk
+            ok, note = print_via_sdk(image_path, copies=copies, cut=_is_cut_mode(cut_mode),
+                                     sharpen=sharpen, **(sdk_kwargs or {}))
+            if ok:
+                method = "dnp_sdk"
+                print(f"[Print] In qua DNP SDK thanh cong: {note}", flush=True)
+            else:
+                sdk_error = note
+                print(f"[Print] DNP SDK that bai -> fallback GDI. Ly do: {note}", flush=True)
+        except Exception as exc:
+            sdk_error = str(exc)
+            print(f"[Print] DNP SDK loi -> fallback GDI: {exc}", flush=True)
+
+    # 2) Dự phòng: in qua Windows DC (GDI). KHÔNG fallback sang mspaint: mspaint in "fit to
+    #    page" -> letterbox VIỀN TRẮNG, không bắt lỗi (luôn coi như thành công), và nếu đã
+    #    spool vài bản rồi mới lỗi thì in lại đủ copies -> IN TRÙNG. Thà để lỗi ném ra ngoài
+    #    để endpoint đánh dấu PrintJob 'failed' và in lại có kiểm soát.
+    if method is None:
+        _print_with_windows_dc(image_path, printer_name, copies, cut_mode, scale_x, scale_y, offset_x, offset_y,
+                               sharpen=sharpen)
+        method = "windows_dc"
 
     cut_note = None
-    if _is_cut_mode(cut_mode):
+    # Chỉ cảnh báo về devmode_cut.bin khi THỰC SỰ in qua GDI. In qua SDK thì việc cắt do
+    # SetCutterMode(2INCHCUT) lo, không liên quan DEVMODE -> không hiện note gây hiểu nhầm.
+    if method == "windows_dc" and _is_cut_mode(cut_mode):
         if _resolve_cut_devmode(cut_mode) is None:
             cut_note = ("Chưa có devmode_cut.bin -> dao cắt đang phụ thuộc Printing Defaults của "
                         "driver. Chạy tools/capture_dnp_devmode.py để điều khiển cắt per-job.")
@@ -327,38 +472,12 @@ def print_image_file(image_path, printer_name, copies=1, cut_mode="none", scale_
         "cut_note": cut_note,
         "file_path": image_path,
         "method": method,
+        "sdk_error": sdk_error,
     }
 
 
-def _number_setting(settings, key, default=0):
-    try:
-        return float((settings or {}).get(key, default) or default)
-    except Exception:
-        return float(default)
-
-
-def apply_basic_print_color_settings(image, settings=None):
-    brightness = _number_setting(settings, "print_brightness")
-    contrast = _number_setting(settings, "print_contrast")
-    saturation = _number_setting(settings, "print_saturation")
-    warmth = _number_setting(settings, "print_warmth")
-
-    if brightness:
-        image = ImageEnhance.Brightness(image).enhance(max(0.2, 1 + brightness / 100))
-    if contrast:
-        image = ImageEnhance.Contrast(image).enhance(max(0.2, 1 + contrast / 100))
-    if saturation:
-        image = ImageEnhance.Color(image).enhance(max(0.2, 1 + saturation / 100))
-    if warmth:
-        r, g, b = image.split()
-        r = r.point(lambda value: max(0, min(255, value + warmth)))
-        b = b.point(lambda value: max(0, min(255, value - warmth)))
-        image = Image.merge("RGB", (r, g, b))
-
-    return image
-
-
-def create_test_print_image(output_dir, color_settings=None):
+def create_test_print_image(output_dir):
+    # Tạo ảnh test NEUTRAL (màu gốc). Việc chỉnh màu áp lúc IN qua cùng pipeline như in thật.
     os.makedirs(output_dir, exist_ok=True)
     path = os.path.join(output_dir, f"test_print_{time.strftime('%Y%m%d_%H%M%S')}.jpg")
     image = Image.new("RGB", (1200, 1800), "#fff6df")
@@ -385,6 +504,5 @@ def create_test_print_image(output_dir, color_settings=None):
     draw.rectangle((840, 620, 980, 920), fill="#ffffff")
     draw.text((160, 980), "Color calibration sample", fill="#8b6a4b", font=font_medium)
     draw.text((160, 1560), "If this prints cleanly, printer path is ready.", fill="#2f3e46", font=font_medium)
-    image = apply_basic_print_color_settings(image, color_settings)
     image.save(path, "JPEG", quality=95, subsampling=0)
     return path
